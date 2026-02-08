@@ -189,12 +189,11 @@ impl Recording {
         let content = std::fs::read_to_string(path)?;
         let recording: Recording = serde_json::from_str(&content)?;
         if recording.metadata.format_version != CURRENT_FORMAT_VERSION {
-            eprintln!(
-                "Warning: recording '{}' has format version '{}' (expected '{}'). \
-                 Some fields may use default values.",
-                recording.metadata.name,
-                recording.metadata.format_version,
-                CURRENT_FORMAT_VERSION,
+            tracing::warn!(
+                name = %recording.metadata.name,
+                found = %recording.metadata.format_version,
+                expected = CURRENT_FORMAT_VERSION,
+                "Recording has different format version; some fields may use default values"
             );
         }
         Ok(recording)
