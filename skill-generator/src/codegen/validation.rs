@@ -25,7 +25,7 @@ fn cached_patterns() -> &'static CachedPatterns {
 }
 
 /// Validation error
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationError {
     /// Error type
     pub error_type: ValidationErrorType,

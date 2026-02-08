@@ -4,7 +4,7 @@ use super::postcondition_extractor::Postcondition;
 use serde::{Deserialize, Serialize};
 
 /// Verification condition
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Condition {
     /// Scope of the check
     pub scope: String,
@@ -17,7 +17,7 @@ pub struct Condition {
 }
 
 /// Verification block for SKILL.md
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationBlock {
     /// Type of verification
     pub verification_type: String,
@@ -28,7 +28,7 @@ pub struct VerificationBlock {
 }
 
 /// Hoare Triple representation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HoareTriple {
     /// Precondition (P)
     pub precondition: Vec<Condition>,

@@ -53,7 +53,7 @@ pub struct CompiledStep {
 }
 
 /// Technical context for a step
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TechnicalContext {
     /// Element selectors
     pub selectors: Vec<String>,
@@ -64,7 +64,7 @@ pub struct TechnicalContext {
 }
 
 /// AX metadata for a step
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AxMetadata {
     pub role: Option<String>,
     pub title: Option<String>,
@@ -73,7 +73,7 @@ pub struct AxMetadata {
 }
 
 /// Error recovery block
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorRecovery {
     /// Condition that triggers recovery
     pub trigger_condition: String,
