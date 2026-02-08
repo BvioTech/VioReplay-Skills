@@ -1091,7 +1091,7 @@ mod tests {
         let status = RecordingStatus {
             is_recording: true,
             event_count: 42,
-            duration_seconds: 3.14,
+            duration_seconds: 3.5,
             has_accessibility: true,
             has_screen_recording: false,
         };
