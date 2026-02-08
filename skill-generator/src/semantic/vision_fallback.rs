@@ -43,6 +43,32 @@ impl Default for VisionConfig {
     }
 }
 
+impl VisionConfig {
+    /// Validate configuration values and return errors for invalid settings.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !(0.0..=1.0).contains(&self.ocr_threshold) {
+            errors.push(format!(
+                "ocr_threshold must be 0.0-1.0, got {}",
+                self.ocr_threshold
+            ));
+        }
+        if !(64..=4096).contains(&self.capture_size) {
+            errors.push(format!(
+                "capture_size must be 64-4096, got {}",
+                self.capture_size
+            ));
+        }
+        if self.max_latency_ms == 0 {
+            errors.push("max_latency_ms must be > 0".to_string());
+        }
+        if self.failure_threshold == 0 {
+            errors.push("failure_threshold must be > 0".to_string());
+        }
+        errors
+    }
+}
+
 /// Detected text region
 #[derive(Debug, Clone)]
 pub struct TextRegion {
@@ -1007,6 +1033,83 @@ mod tests {
         use objc::runtime::Class;
         let rect_class = Class::get("VNDetectRectanglesRequest");
         assert!(rect_class.is_some(), "VNDetectRectanglesRequest should be available");
+    }
+
+    #[test]
+    fn test_validate_default_config_passes() {
+        let config = VisionConfig::default();
+        let errors = config.validate();
+        assert!(errors.is_empty(), "Default config should be valid: {:?}", errors);
+    }
+
+    #[test]
+    fn test_validate_ocr_threshold_out_of_range() {
+        let config = VisionConfig { ocr_threshold: 1.5, ..Default::default() };
+        let errors = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("ocr_threshold"));
+
+        let config = VisionConfig { ocr_threshold: -0.1, ..Default::default() };
+        let errors = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("ocr_threshold"));
+    }
+
+    #[test]
+    fn test_validate_ocr_threshold_boundary() {
+        let config = VisionConfig { ocr_threshold: 0.0, ..Default::default() };
+        assert!(config.validate().is_empty());
+        let config = VisionConfig { ocr_threshold: 1.0, ..Default::default() };
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn test_validate_capture_size_out_of_range() {
+        let config = VisionConfig { capture_size: 32, ..Default::default() };
+        let errors = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("capture_size"));
+
+        let config = VisionConfig { capture_size: 8192, ..Default::default() };
+        let errors = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("capture_size"));
+    }
+
+    #[test]
+    fn test_validate_capture_size_boundary() {
+        let config = VisionConfig { capture_size: 64, ..Default::default() };
+        assert!(config.validate().is_empty());
+        let config = VisionConfig { capture_size: 4096, ..Default::default() };
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn test_validate_zero_latency() {
+        let config = VisionConfig { max_latency_ms: 0, ..Default::default() };
+        let errors = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("max_latency_ms"));
+    }
+
+    #[test]
+    fn test_validate_zero_failure_threshold() {
+        let config = VisionConfig { failure_threshold: 0, ..Default::default() };
+        let errors = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("failure_threshold"));
+    }
+
+    #[test]
+    fn test_validate_multiple_errors() {
+        let config = VisionConfig {
+            capture_size: 10,
+            ocr_threshold: 2.0,
+            max_latency_ms: 0,
+            failure_threshold: 0,
+        };
+        let errors = config.validate();
+        assert_eq!(errors.len(), 4, "All four fields are invalid: {:?}", errors);
     }
 
     #[test]
