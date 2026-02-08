@@ -187,12 +187,33 @@ impl VariableExtractor {
 
         // Step 4: Use LLM to enhance low-confidence variables
         let variables = if self.config.use_llm && self.llm_synthesizer.is_some() {
-            self.enhance_with_llm(variables, events, goal)
+            self.enhance_with_llm(variables, events, goal, None)
         } else {
             variables
         };
 
         // Deduplicate
+        self.deduplicate_variables(variables)
+    }
+
+    /// Extract variables with a shared tokio runtime for LLM calls
+    pub fn extract_with_runtime(&self, events: &[EnrichedEvent], goal: &str, rt: &tokio::runtime::Runtime) -> Vec<ExtractedVariable> {
+        let mut variables = Vec::new();
+
+        let goal_tokens = self.tokenize_goal(goal);
+        variables.extend(self.match_goal_tokens(events, &goal_tokens));
+        variables.extend(self.find_high_entropy_strings(events));
+
+        if self.config.detect_implicit {
+            variables.extend(self.detect_implicit_variables(events));
+        }
+
+        let variables = if self.config.use_llm && self.llm_synthesizer.is_some() {
+            self.enhance_with_llm(variables, events, goal, Some(rt))
+        } else {
+            variables
+        };
+
         self.deduplicate_variables(variables)
     }
 
@@ -202,6 +223,7 @@ impl VariableExtractor {
         mut variables: Vec<ExtractedVariable>,
         events: &[EnrichedEvent],
         goal: &str,
+        shared_runtime: Option<&tokio::runtime::Runtime>,
     ) -> Vec<ExtractedVariable> {
         // Verify LLM is available (already checked by caller, but be defensive)
         if self.llm_synthesizer.is_none() {
@@ -225,13 +247,19 @@ impl VariableExtractor {
 
         debug!("Invoking LLM for {} unmatched typed strings", unmatched.len());
 
-        // Create a runtime to call async LLM
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(e) => {
-                debug!("Failed to create tokio runtime for LLM: {}", e);
-                return variables;
-            }
+        // Use shared runtime if available, otherwise create one
+        let owned_rt;
+        let rt = if let Some(shared) = shared_runtime {
+            shared
+        } else {
+            owned_rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    debug!("Failed to create tokio runtime for LLM: {}", e);
+                    return variables;
+                }
+            };
+            &owned_rt
         };
 
         // Process each unmatched string with LLM

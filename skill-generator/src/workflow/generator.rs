@@ -181,9 +181,26 @@ impl SkillGenerator {
             .count();
         stats.local_recovery_count = missing_before.saturating_sub(missing_after_local);
 
+        // Create a shared tokio runtime for all async LLM calls in this generation
+        let runtime = if self.config.use_llm_semantic || self.config.extract_variables {
+            match tokio::runtime::Runtime::new() {
+                Ok(rt) => Some(rt),
+                Err(e) => {
+                    debug!("Failed to create tokio runtime for LLM: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Step 0b: LLM semantic inference for remaining gaps (slower, requires API key)
         let enriched_recording = if self.config.use_llm_semantic {
-            self.enrich_with_llm_semantic(&locally_recovered)
+            if let Some(ref rt) = runtime {
+                self.enrich_with_llm_semantic(&locally_recovered, rt)
+            } else {
+                locally_recovered
+            }
         } else {
             locally_recovered
         };
@@ -244,7 +261,11 @@ impl SkillGenerator {
         // Step 3: Extract variables
         let variables = if self.config.extract_variables {
             let goal = enriched_recording.metadata.goal.as_deref().unwrap_or("");
-            self.variable_extractor.extract(&enriched_recording.events, goal)
+            if let Some(ref rt) = runtime {
+                self.variable_extractor.extract_with_runtime(&enriched_recording.events, goal, rt)
+            } else {
+                self.variable_extractor.extract(&enriched_recording.events, goal)
+            }
         } else {
             Vec::new()
         };
@@ -375,7 +396,7 @@ impl SkillGenerator {
     }
 
     /// Enrich events with LLM semantic inference for those missing semantic data
-    fn enrich_with_llm_semantic(&self, recording: &Recording) -> Recording {
+    fn enrich_with_llm_semantic(&self, recording: &Recording, rt: &tokio::runtime::Runtime) -> Recording {
         let goal = recording.metadata.goal.as_deref().unwrap_or("");
 
         // Resolve API key: config takes priority, then env var
@@ -409,15 +430,6 @@ impl SkillGenerator {
 
         // Create a mutable copy of the recording
         let mut enriched = recording.clone();
-
-        // Create tokio runtime for async LLM calls
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(e) => {
-                debug!("Failed to create tokio runtime for LLM: {}", e);
-                return recording.clone();
-            }
-        };
 
         // Process each event that needs semantic data
         for (idx, _event) in events_needing_semantic {

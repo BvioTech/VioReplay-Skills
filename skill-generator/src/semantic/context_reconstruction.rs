@@ -41,6 +41,8 @@ pub struct ReconstructionResult {
 pub struct ContextReconstructor {
     /// Configuration
     pub config: ReconstructionConfig,
+    /// Shared HTTP client for LLM API calls
+    http_client: reqwest::Client,
 }
 
 impl ContextReconstructor {
@@ -48,12 +50,24 @@ impl ContextReconstructor {
     pub fn new() -> Self {
         Self {
             config: ReconstructionConfig::default(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .pool_max_idle_per_host(2)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
     /// Create with custom config
     pub fn with_config(config: ReconstructionConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .pool_max_idle_per_host(2)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+        }
     }
 
     /// Check if reconstruction should be triggered
@@ -247,18 +261,8 @@ Respond in JSON format:
             context
         );
 
-        // Call Anthropic API
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("Failed to build HTTP client: {}", e);
-                return None;
-            }
-        };
-        let response = match client
+        // Call Anthropic API using shared client
+        let response = match self.http_client
             .post("https://api.anthropic.com/v1/messages")
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")

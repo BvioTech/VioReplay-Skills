@@ -77,7 +77,11 @@ impl LlmSynthesizer {
             model: "claude-sonnet-4-5-20250929".to_string(),
             temperature: 0.3,
             api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .pool_max_idle_per_host(2)
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             cache: HashMap::new(),
             cache_ttl: 3600, // 1 hour
         }
@@ -90,7 +94,11 @@ impl LlmSynthesizer {
             model: "claude-sonnet-4-5-20250929".to_string(),
             temperature: 0.3,
             api_key: Some(api_key.to_string()),
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .pool_max_idle_per_host(2)
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             cache: HashMap::new(),
             cache_ttl: 3600,
         }

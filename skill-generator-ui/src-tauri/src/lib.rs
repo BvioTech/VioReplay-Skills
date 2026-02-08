@@ -780,6 +780,47 @@ fn read_skill_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("Failed to read {}: {}", path, e))
 }
 
+/// Export the current config as a TOML string
+#[tauri::command]
+fn export_config() -> Result<String, String> {
+    let config = Config::load_default().map_err(|e| e.to_string())?;
+    config.to_toml().map_err(|e| e.to_string())
+}
+
+/// Import config from a TOML string, validate, and save
+#[tauri::command(rename_all = "camelCase")]
+fn import_config(toml_content: String) -> Result<(), String> {
+    // Validate by parsing
+    let config: Config = toml::from_str(&toml_content)
+        .map_err(|e| format!("Invalid TOML config: {}", e))?;
+    config.save_default().map_err(|e| e.to_string())?;
+    info!("Config imported and saved");
+    Ok(())
+}
+
+/// Read a recording JSON file for export
+#[tauri::command(rename_all = "camelCase")]
+fn read_recording_file(recording_path: String) -> Result<String, String> {
+    let recordings_dir = dirs::home_dir()
+        .ok_or("Could not find home directory")?
+        .join(".skill_generator")
+        .join("recordings");
+
+    let path = std::path::Path::new(&recording_path);
+    if !path.exists() {
+        return Err(format!("Recording not found: {}", recording_path));
+    }
+
+    // Validate path is within recordings directory
+    let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+    let canonical_dir = std::fs::canonicalize(&recordings_dir).map_err(|e| e.to_string())?;
+    if !canonical.starts_with(&canonical_dir) {
+        return Err("Access denied: path is outside the recordings directory".to_string());
+    }
+
+    std::fs::read_to_string(path).map_err(|e| format!("Failed to read recording: {}", e))
+}
+
 /// Info about a generated skill for the frontend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillListEntry {
@@ -939,6 +980,9 @@ pub fn run() {
             read_skill_file,
             list_generated_skills,
             delete_skill,
+            export_config,
+            import_config,
+            read_recording_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

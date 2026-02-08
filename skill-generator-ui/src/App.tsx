@@ -501,6 +501,59 @@ function App() {
     }
   }
 
+  async function handleExportConfig() {
+    try {
+      const toml = await invoke<string>("export_config");
+      const blob = new Blob([toml], { type: "application/toml" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "skill-generator-config.toml";
+      a.click();
+      URL.revokeObjectURL(url);
+      setSuccess("Config exported");
+    } catch (e: unknown) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      setError(`Failed to export config: ${errorMsg}`);
+    }
+  }
+
+  function handleImportConfig() {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".toml";
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      try {
+        const tomlContent = await file.text();
+        await invoke("import_config", { tomlContent });
+        setSuccess("Config imported successfully");
+        loadConfig();
+      } catch (e: unknown) {
+        const errorMsg = e instanceof Error ? e.message : String(e);
+        setError(`Failed to import config: ${errorMsg}`);
+      }
+    };
+    input.click();
+  }
+
+  async function handleExportRecording(path: string, name: string) {
+    try {
+      const content = await invoke<string>("read_recording_file", { recordingPath: path });
+      const blob = new Blob([content], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${name}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      setError(`Failed to export recording: ${errorMsg}`);
+    }
+  }
+
   async function handleDeleteSkill(path: string, name: string) {
     if (confirmDeleteSkill === path) {
       setConfirmDeleteSkill(null);
@@ -569,26 +622,34 @@ function App() {
       </header>
 
       {/* Navigation Tabs */}
-      <nav className="tab-bar">
+      <nav className="tab-bar" role="tablist" aria-label="Main navigation">
         <button
+          role="tab"
+          aria-selected={activeTab === "record"}
           className={`tab ${activeTab === "record" ? "tab-active" : ""}`}
           onClick={() => setActiveTab("record")}
         >
           Record
         </button>
         <button
+          role="tab"
+          aria-selected={activeTab === "recordings"}
           className={`tab ${activeTab === "recordings" ? "tab-active" : ""}`}
           onClick={() => setActiveTab("recordings")}
         >
           Recordings{recordings.length > 0 ? ` (${recordings.length})` : ""}
         </button>
         <button
+          role="tab"
+          aria-selected={activeTab === "skills"}
           className={`tab ${activeTab === "skills" ? "tab-active" : ""}`}
           onClick={() => { setActiveTab("skills"); loadSkills(); }}
         >
           Skills{skills.length > 0 ? ` (${skills.length})` : ""}
         </button>
         <button
+          role="tab"
+          aria-selected={activeTab === "settings"}
           className={`tab ${activeTab === "settings" ? "tab-active" : ""}`}
           onClick={() => setActiveTab("settings")}
         >
@@ -610,12 +671,17 @@ function App() {
         )}
       </div>
 
+      {/* Recording state announcements for screen readers */}
+      <div className="sr-only" aria-live="assertive" role="status">
+        {isRecording ? `Recording in progress. ${eventCount} events captured.` : ""}
+      </div>
+
       {/* Record Tab */}
       {activeTab === "record" && (
-        <div className="tab-content">
+        <div className="tab-content" role="tabpanel" aria-label="Record">
           {/* Permission Warnings */}
           {!hasAccessibility && (
-            <div className="alert warning">
+            <div className="alert warning" role="alert">
               Accessibility permission required. Enable in System Settings &gt; Privacy &amp; Security &gt; Accessibility.
             </div>
           )}
@@ -628,16 +694,16 @@ function App() {
                     <span className="recording-dot" aria-hidden="true" />
                     Recording
                   </span>
-                  <span className="recording-rate">{eventsPerSecond} evt/s</span>
+                  <span className="recording-rate" aria-label={`${eventsPerSecond} events per second`}>{eventsPerSecond} evt/s</span>
                 </div>
 
-                <div className="recording-stats">
+                <div className="recording-stats" aria-label="Recording statistics">
                   <div className="stat stat-large">
-                    <span className="stat-value">{formatDuration(duration)}</span>
+                    <span className="stat-value" aria-label={`Duration: ${formatDuration(duration)}`}>{formatDuration(duration)}</span>
                     <span className="stat-label">Duration</span>
                   </div>
                   <div className="stat stat-large">
-                    <span className="stat-value">{eventCount.toLocaleString()}</span>
+                    <span className="stat-value" aria-label={`${eventCount} events`}>{eventCount.toLocaleString()}</span>
                     <span className="stat-label">Events</span>
                   </div>
                 </div>
@@ -680,7 +746,7 @@ function App() {
 
       {/* Recordings Tab */}
       {activeTab === "recordings" && (
-        <div className="tab-content">
+        <div className="tab-content" role="tabpanel" aria-label="Recordings">
           {/* Skill Preview */}
           {previewContent && (
             <section className="panel preview-panel">
@@ -728,42 +794,42 @@ function App() {
                   Dismiss
                 </button>
               </div>
-              <div className="stats-grid">
-                <div className="stat-item">
-                  <span className="stat-number">{pipelineStats.significant_events_count}</span>
-                  <span className="stat-desc">Significant Events</span>
+              <div className="stats-grid" role="list" aria-label="Pipeline statistics">
+                <div className="stat-item" role="listitem" aria-label={`Significant Events: ${pipelineStats.significant_events_count}`}>
+                  <span className="stat-number" aria-hidden="true">{pipelineStats.significant_events_count}</span>
+                  <span className="stat-desc" aria-hidden="true">Significant Events</span>
                 </div>
-                <div className="stat-item">
-                  <span className="stat-number">{pipelineStats.generated_steps_count}</span>
-                  <span className="stat-desc">Generated Steps</span>
+                <div className="stat-item" role="listitem" aria-label={`Generated Steps: ${pipelineStats.generated_steps_count}`}>
+                  <span className="stat-number" aria-hidden="true">{pipelineStats.generated_steps_count}</span>
+                  <span className="stat-desc" aria-hidden="true">Generated Steps</span>
                 </div>
-                <div className="stat-item">
-                  <span className="stat-number">{pipelineStats.variables_count}</span>
-                  <span className="stat-desc">Variables Extracted</span>
+                <div className="stat-item" role="listitem" aria-label={`Variables Extracted: ${pipelineStats.variables_count}`}>
+                  <span className="stat-number" aria-hidden="true">{pipelineStats.variables_count}</span>
+                  <span className="stat-desc" aria-hidden="true">Variables Extracted</span>
                 </div>
-                <div className="stat-item">
-                  <span className="stat-number">{pipelineStats.unit_tasks_count}</span>
-                  <span className="stat-desc">Unit Tasks</span>
+                <div className="stat-item" role="listitem" aria-label={`Unit Tasks: ${pipelineStats.unit_tasks_count}`}>
+                  <span className="stat-number" aria-hidden="true">{pipelineStats.unit_tasks_count}</span>
+                  <span className="stat-desc" aria-hidden="true">Unit Tasks</span>
                 </div>
-                <div className="stat-item">
-                  <span className="stat-number">{pipelineStats.goms_boundaries_count}</span>
-                  <span className="stat-desc">GOMS Boundaries</span>
+                <div className="stat-item" role="listitem" aria-label={`GOMS Boundaries: ${pipelineStats.goms_boundaries_count}`}>
+                  <span className="stat-number" aria-hidden="true">{pipelineStats.goms_boundaries_count}</span>
+                  <span className="stat-desc" aria-hidden="true">GOMS Boundaries</span>
                 </div>
-                <div className="stat-item">
-                  <span className="stat-number">{pipelineStats.context_transitions_count}</span>
-                  <span className="stat-desc">Context Transitions</span>
+                <div className="stat-item" role="listitem" aria-label={`Context Transitions: ${pipelineStats.context_transitions_count}`}>
+                  <span className="stat-number" aria-hidden="true">{pipelineStats.context_transitions_count}</span>
+                  <span className="stat-desc" aria-hidden="true">Context Transitions</span>
                 </div>
-                <div className="stat-item">
-                  <span className="stat-number">{pipelineStats.local_recovery_count}</span>
-                  <span className="stat-desc">Local Recoveries</span>
+                <div className="stat-item" role="listitem" aria-label={`Local Recoveries: ${pipelineStats.local_recovery_count}`}>
+                  <span className="stat-number" aria-hidden="true">{pipelineStats.local_recovery_count}</span>
+                  <span className="stat-desc" aria-hidden="true">Local Recoveries</span>
                 </div>
-                <div className="stat-item">
-                  <span className="stat-number">{pipelineStats.llm_enriched_count}</span>
-                  <span className="stat-desc">LLM Enriched</span>
+                <div className="stat-item" role="listitem" aria-label={`LLM Enriched: ${pipelineStats.llm_enriched_count}`}>
+                  <span className="stat-number" aria-hidden="true">{pipelineStats.llm_enriched_count}</span>
+                  <span className="stat-desc" aria-hidden="true">LLM Enriched</span>
                 </div>
-                <div className="stat-item">
-                  <span className="stat-number">{pipelineStats.trajectory_adjustments_count}</span>
-                  <span className="stat-desc">Trajectory Adjustments</span>
+                <div className="stat-item" role="listitem" aria-label={`Trajectory Adjustments: ${pipelineStats.trajectory_adjustments_count}`}>
+                  <span className="stat-number" aria-hidden="true">{pipelineStats.trajectory_adjustments_count}</span>
+                  <span className="stat-desc" aria-hidden="true">Trajectory Adjustments</span>
                 </div>
               </div>
             </section>
@@ -845,6 +911,13 @@ function App() {
                       )}
                       <button
                         className="btn btn-small"
+                        onClick={() => handleExportRecording(rec.path, rec.name)}
+                        title="Export recording as JSON"
+                      >
+                        Export
+                      </button>
+                      <button
+                        className="btn btn-small"
                         onClick={() => handleOpenInFinder(rec.path)}
                         title="Reveal in Finder"
                       >
@@ -868,7 +941,7 @@ function App() {
 
       {/* Skills Tab */}
       {activeTab === "skills" && (
-        <div className="tab-content">
+        <div className="tab-content" role="tabpanel" aria-label="Skills">
           {/* Skill Preview */}
           {skillPreviewContent && (
             <section className="panel preview-panel">
@@ -977,7 +1050,7 @@ function App() {
 
       {/* Settings Tab */}
       {activeTab === "settings" && (
-        <div className="tab-content">
+        <div className="tab-content" role="tabpanel" aria-label="Settings">
           {/* API Key Section */}
           <section className="panel">
             <h2 className="panel-title">Anthropic API Key</h2>
@@ -1116,9 +1189,37 @@ function App() {
                 <button className="btn btn-primary" onClick={handleSaveConfig} disabled={savingConfig}>
                   {savingConfig ? "Saving..." : "Save Configuration"}
                 </button>
+
+                <div className="config-export-row">
+                  <button className="btn btn-small" onClick={handleExportConfig}>
+                    Export Config
+                  </button>
+                  <button className="btn btn-small" onClick={handleImportConfig}>
+                    Import Config
+                  </button>
+                </div>
               </div>
             </section>
           )}
+
+          {/* Keyboard Shortcuts */}
+          <section className="panel">
+            <h2 className="panel-title">Keyboard Shortcuts</h2>
+            <dl className="shortcuts-list">
+              <div className="shortcut-row">
+                <dt><kbd>Cmd</kbd> + <kbd>R</kbd></dt>
+                <dd>Start recording</dd>
+              </div>
+              <div className="shortcut-row">
+                <dt><kbd>Esc</kbd></dt>
+                <dd>Stop recording</dd>
+              </div>
+              <div className="shortcut-row">
+                <dt><kbd>Enter</kbd></dt>
+                <dd>Save API key (when focused)</dd>
+              </div>
+            </dl>
+          </section>
 
           {/* About */}
           <section className="panel panel-muted">
@@ -1130,7 +1231,7 @@ function App() {
             </p>
             <div className="about-meta">
               <span>v0.1.0</span>
-              <span>609 tests passing</span>
+              <span>619 tests passing</span>
             </div>
           </section>
         </div>
