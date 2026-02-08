@@ -6,7 +6,7 @@
 
 use std::sync::OnceLock;
 
-/// Global timebase info, initialized once at startup
+/// Global timebase info, auto-initialized on first access
 static TIMEBASE_INFO: OnceLock<TimebaseInfo> = OnceLock::new();
 
 /// Cached timebase conversion factors
@@ -14,6 +14,24 @@ static TIMEBASE_INFO: OnceLock<TimebaseInfo> = OnceLock::new();
 struct TimebaseInfo {
     numer: u32,
     denom: u32,
+}
+
+/// Get or initialize the timebase info. Safe to call from any thread at any time.
+fn timebase_info() -> &'static TimebaseInfo {
+    TIMEBASE_INFO.get_or_init(|| {
+        let mut info = mach2::mach_time::mach_timebase_info_data_t {
+            numer: 0,
+            denom: 0,
+        };
+        // Safety: mach_timebase_info is always safe to call
+        unsafe {
+            mach2::mach_time::mach_timebase_info(&mut info);
+        }
+        TimebaseInfo {
+            numer: info.numer,
+            denom: info.denom,
+        }
+    })
 }
 
 /// High-precision timebase using mach_absolute_time
@@ -27,23 +45,10 @@ struct TimebaseInfo {
 pub struct MachTimebase;
 
 impl MachTimebase {
-    /// Initialize the timebase. Call once at startup.
-    /// This fetches mach_timebase_info() and caches the conversion factors.
+    /// Initialize the timebase. Safe to call multiple times (no-op after first).
+    /// Also auto-initializes on first conversion call, so explicit init is optional.
     pub fn init() {
-        TIMEBASE_INFO.get_or_init(|| {
-            let mut info = mach2::mach_time::mach_timebase_info_data_t {
-                numer: 0,
-                denom: 0,
-            };
-            // Safety: mach_timebase_info is always safe to call
-            unsafe {
-                mach2::mach_time::mach_timebase_info(&mut info);
-            }
-            TimebaseInfo {
-                numer: info.numer,
-                denom: info.denom,
-            }
-        });
+        let _ = timebase_info();
     }
 
     /// Get current mach_absolute_time ticks.
@@ -60,7 +65,7 @@ impl MachTimebase {
     /// On Intel, it varies based on CPU frequency.
     #[inline]
     pub fn ticks_to_nanos(ticks: u64) -> u64 {
-        let info = TIMEBASE_INFO.get().expect("MachTimebase::init() not called");
+        let info = timebase_info();
         // Use u128 to prevent overflow on large tick counts
         ((ticks as u128 * info.numer as u128) / info.denom as u128) as u64
     }
@@ -115,7 +120,7 @@ impl MachTimebase {
 
     /// Get the timebase info for debugging/logging.
     pub fn get_timebase_info() -> (u32, u32) {
-        let info = TIMEBASE_INFO.get().expect("MachTimebase::init() not called");
+        let info = timebase_info();
         (info.numer, info.denom)
     }
 
@@ -224,7 +229,7 @@ impl Duration {
     /// Create a duration from nanoseconds.
     #[inline]
     pub fn from_nanos(nanos: u64) -> Self {
-        let info = TIMEBASE_INFO.get().expect("MachTimebase::init() not called");
+        let info = timebase_info();
         let ticks = ((nanos as u128 * info.denom as u128) / info.numer as u128) as u64;
         Self(ticks)
     }
@@ -515,6 +520,15 @@ mod tests {
         assert!(MachTimebase::is_monotonic(100, 200), "increasing should be monotonic");
         assert!(!MachTimebase::is_monotonic(200, 100), "decreasing should not be monotonic");
         assert!(MachTimebase::is_monotonic(0, 0), "zero should be monotonic with itself");
+    }
+
+    #[test]
+    fn test_auto_init_on_conversion() {
+        // Timebase auto-initializes on first use, no explicit init() needed.
+        // OnceLock ensures this is safe even if init() was already called.
+        let ticks = 1_000_000u64;
+        let nanos = MachTimebase::ticks_to_nanos(ticks);
+        assert!(nanos > 0, "auto-init should produce valid conversion");
     }
 
     #[test]
