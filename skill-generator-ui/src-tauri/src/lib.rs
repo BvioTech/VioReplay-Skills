@@ -801,6 +801,7 @@ fn save_config(config: UiConfig) -> Result<(), String> {
     full_config.pipeline.use_trajectory_analysis = config.use_trajectory_analysis;
     full_config.pipeline.use_goms_detection = config.use_goms_detection;
     full_config.pipeline.use_context_tracking = config.use_context_tracking;
+    full_config.validate().map_err(|e| e.to_string())?;
     full_config.save_default().map_err(|e| e.to_string())?;
     info!("Configuration saved");
     Ok(())
@@ -822,9 +823,10 @@ fn export_config() -> Result<String, String> {
 /// Import config from a TOML string, validate, and save
 #[tauri::command(rename_all = "camelCase")]
 fn import_config(toml_content: String) -> Result<(), String> {
-    // Validate by parsing
+    // Parse and validate before saving
     let config: Config = toml::from_str(&toml_content)
         .map_err(|e| format!("Invalid TOML config: {}", e))?;
+    config.validate().map_err(|e| e.to_string())?;
     config.save_default().map_err(|e| e.to_string())?;
     info!("Config imported and saved");
     Ok(())

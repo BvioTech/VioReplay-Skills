@@ -244,6 +244,8 @@ function App() {
   const [loadingRecordings, setLoadingRecordings] = useState(false);
   const [loadingSkills, setLoadingSkills] = useState(false);
   const [savingConfig, setSavingConfig] = useState(false);
+  const [exportingConfig, setExportingConfig] = useState(false);
+  const [exportingRecording, setExportingRecording] = useState<string | null>(null);
 
   // UI state
   const [error, setError] = useState<string | null>(null);
@@ -495,9 +497,23 @@ function App() {
     }
   }
 
+  function validateConfig(c: UiConfig): string | null {
+    if (c.rdp_epsilon_px <= 0 || c.rdp_epsilon_px > 100) return "RDP epsilon must be between 0 and 100";
+    if (c.hesitation_threshold < 0 || c.hesitation_threshold > 1) return "Hesitation threshold must be between 0 and 1";
+    if (c.min_pause_ms === 0) return "Min pause must be greater than 0";
+    if (c.temperature < 0 || c.temperature > 2) return "Temperature must be between 0 and 2";
+    if (!c.model || c.model.trim() === "") return "Model name cannot be empty";
+    return null;
+  }
+
   async function handleSaveConfig() {
     if (!config || savingConfig) return;
     setError(null);
+    const validationError = validateConfig(config);
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
     setSavingConfig(true);
     try {
       await invoke("save_config", { config });
@@ -558,6 +574,8 @@ function App() {
   }
 
   async function handleExportConfig() {
+    if (exportingConfig) return;
+    setExportingConfig(true);
     try {
       const toml = await invoke<string>("export_config");
       const blob = new Blob([toml], { type: "application/toml" });
@@ -571,6 +589,8 @@ function App() {
     } catch (e: unknown) {
       const errorMsg = e instanceof Error ? e.message : String(e);
       setError(`Failed to export config: ${errorMsg}`);
+    } finally {
+      setExportingConfig(false);
     }
   }
 
@@ -595,6 +615,8 @@ function App() {
   }
 
   async function handleExportRecording(path: string, name: string) {
+    if (exportingRecording) return;
+    setExportingRecording(path);
     try {
       const content = await invoke<string>("read_recording_file", { recordingPath: path });
       const blob = new Blob([content], { type: "application/json" });
@@ -607,6 +629,8 @@ function App() {
     } catch (e: unknown) {
       const errorMsg = e instanceof Error ? e.message : String(e);
       setError(`Failed to export recording: ${errorMsg}`);
+    } finally {
+      setExportingRecording(null);
     }
   }
 
@@ -979,8 +1003,9 @@ function App() {
                         className="btn btn-small"
                         onClick={() => handleExportRecording(rec.path, rec.name)}
                         title="Export recording as JSON"
+                        disabled={exportingRecording === rec.path}
                       >
-                        Export
+                        {exportingRecording === rec.path ? "Exporting..." : "Export"}
                       </button>
                       <button
                         className="btn btn-small"
@@ -1257,8 +1282,8 @@ function App() {
                 </button>
 
                 <div className="config-export-row">
-                  <button className="btn btn-small" onClick={handleExportConfig}>
-                    Export Config
+                  <button className="btn btn-small" onClick={handleExportConfig} disabled={exportingConfig}>
+                    {exportingConfig ? "Exporting..." : "Export Config"}
                   </button>
                   <button className="btn btn-small" onClick={handleImportConfig}>
                     Import Config
