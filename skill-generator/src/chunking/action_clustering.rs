@@ -53,6 +53,26 @@ impl Default for ClusteringConfig {
     }
 }
 
+impl ClusteringConfig {
+    /// Validate configuration values and return errors for invalid settings.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.max_gap_ms == 0 {
+            errors.push("max_gap_ms must be > 0".to_string());
+        }
+        if self.min_events == 0 {
+            errors.push("min_events must be > 0".to_string());
+        }
+        if self.min_movement_px < 0.0 {
+            errors.push(format!(
+                "min_movement_px must be >= 0.0, got {}",
+                self.min_movement_px
+            ));
+        }
+        errors
+    }
+}
+
 /// Action clusterer
 pub struct ActionClusterer {
     /// Configuration
@@ -979,5 +999,53 @@ mod tests {
         let mut clusterer = ActionClusterer::new();
         let tasks = clusterer.flush();
         assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn test_validate_default_config() {
+        let config = ClusteringConfig::default();
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn test_validate_zero_max_gap() {
+        let config = ClusteringConfig { max_gap_ms: 0, ..Default::default() };
+        let errors = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("max_gap_ms"));
+    }
+
+    #[test]
+    fn test_validate_zero_min_events() {
+        let config = ClusteringConfig { min_events: 0, ..Default::default() };
+        let errors = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("min_events"));
+    }
+
+    #[test]
+    fn test_validate_negative_movement() {
+        let config = ClusteringConfig { min_movement_px: -1.0, ..Default::default() };
+        let errors = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("min_movement_px"));
+    }
+
+    #[test]
+    fn test_validate_multiple_errors() {
+        let config = ClusteringConfig {
+            max_gap_ms: 0,
+            min_events: 0,
+            merge_transient: true,
+            min_movement_px: -5.0,
+        };
+        let errors = config.validate();
+        assert_eq!(errors.len(), 3);
+    }
+
+    #[test]
+    fn test_validate_zero_movement_is_ok() {
+        let config = ClusteringConfig { min_movement_px: 0.0, ..Default::default() };
+        assert!(config.validate().is_empty());
     }
 }

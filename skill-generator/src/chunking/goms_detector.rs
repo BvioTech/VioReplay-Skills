@@ -66,6 +66,30 @@ impl GomsDetector {
         }
     }
 
+    /// Validate detector parameters and return errors for invalid settings.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !(0.0..=1.0).contains(&self.mental_threshold) {
+            errors.push(format!(
+                "mental_threshold must be 0.0-1.0, got {}",
+                self.mental_threshold
+            ));
+        }
+        if self.min_pause_ms == 0 {
+            errors.push("min_pause_ms must be > 0".to_string());
+        }
+        if self.max_pause_ms == 0 {
+            errors.push("max_pause_ms must be > 0".to_string());
+        }
+        if self.max_pause_ms < self.min_pause_ms {
+            errors.push(format!(
+                "max_pause_ms ({}) must be >= min_pause_ms ({})",
+                self.max_pause_ms, self.min_pause_ms
+            ));
+        }
+        errors
+    }
+
     /// Detect chunk boundaries in an event stream
     pub fn detect_boundaries(&self, events: &[EnrichedEvent]) -> Vec<ChunkBoundary> {
         MachTimebase::init();
@@ -855,5 +879,72 @@ mod tests {
             assert_eq!(boundary.operator_type, OperatorType::Mental);
             assert!(boundary.confidence > 0.0);
         }
+    }
+
+    #[test]
+    fn test_validate_default_detector() {
+        let detector = GomsDetector::new();
+        assert!(detector.validate().is_empty());
+    }
+
+    #[test]
+    fn test_validate_threshold_out_of_range() {
+        let detector = GomsDetector {
+            mental_threshold: 1.5,
+            ..GomsDetector::new()
+        };
+        let errors = detector.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("mental_threshold"));
+    }
+
+    #[test]
+    fn test_validate_threshold_boundary() {
+        let d = GomsDetector { mental_threshold: 0.0, ..GomsDetector::new() };
+        assert!(d.validate().is_empty());
+        let d = GomsDetector { mental_threshold: 1.0, ..GomsDetector::new() };
+        assert!(d.validate().is_empty());
+    }
+
+    #[test]
+    fn test_validate_zero_min_pause() {
+        let detector = GomsDetector {
+            min_pause_ms: 0,
+            ..GomsDetector::new()
+        };
+        let errors = detector.validate();
+        assert!(errors.iter().any(|e| e.contains("min_pause_ms")));
+    }
+
+    #[test]
+    fn test_validate_zero_max_pause() {
+        let detector = GomsDetector {
+            max_pause_ms: 0,
+            ..GomsDetector::new()
+        };
+        let errors = detector.validate();
+        assert!(errors.iter().any(|e| e.contains("max_pause_ms")));
+    }
+
+    #[test]
+    fn test_validate_max_less_than_min() {
+        let detector = GomsDetector {
+            min_pause_ms: 500,
+            max_pause_ms: 200,
+            ..GomsDetector::new()
+        };
+        let errors = detector.validate();
+        assert!(errors.iter().any(|e| e.contains("max_pause_ms") && e.contains("min_pause_ms")));
+    }
+
+    #[test]
+    fn test_validate_multiple_errors() {
+        let detector = GomsDetector {
+            mental_threshold: -0.5,
+            min_pause_ms: 0,
+            max_pause_ms: 0,
+        };
+        let errors = detector.validate();
+        assert!(errors.len() >= 3);
     }
 }
