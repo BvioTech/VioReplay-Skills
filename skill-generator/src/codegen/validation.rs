@@ -147,7 +147,7 @@ impl SkillValidator {
             });
         } else {
             // Validate YAML syntax
-            if serde_yaml::from_str::<serde_yaml::Value>(parts[1]).is_err() {
+            if serde_yaml_ng::from_str::<serde_yaml_ng::Value>(parts[1]).is_err() {
                 errors.push(ValidationError {
                     error_type: ValidationErrorType::YamlSyntax,
                     message: "Invalid YAML in frontmatter".to_string(),

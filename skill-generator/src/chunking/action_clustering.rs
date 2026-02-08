@@ -84,8 +84,7 @@ impl ActionClusterer {
         let mut completed_tasks = Vec::new();
         
         // Check if we should flush existing pending events
-        if !self.pending.is_empty() {
-            let last = self.pending.back().unwrap();
+        if let Some(last) = self.pending.back() {
             if self.should_split_streaming(last, &event) {
                 // Flush pending events as a task
                 let events: Vec<EnrichedEvent> = self.pending.drain(..).collect();
@@ -188,11 +187,10 @@ impl ActionClusterer {
 
     /// Check if we should split at this event
     fn should_split(&self, current: &[EnrichedEvent], next: &EnrichedEvent) -> bool {
-        if current.is_empty() {
-            return false;
-        }
-
-        let last = current.last().unwrap();
+        let last = match current.last() {
+            Some(l) => l,
+            None => return false,
+        };
 
         // Time gap check
         let time_gap = if next.raw.timestamp.ticks() > last.raw.timestamp.ticks() {

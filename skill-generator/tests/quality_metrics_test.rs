@@ -565,7 +565,7 @@ fn test_markdown_structure_validity() {
     assert!(frontmatter.contains("context:"), "Frontmatter should contain context field");
 
     // Verify frontmatter is valid YAML
-    let yaml_result: Result<serde_yaml::Value, _> = serde_yaml::from_str(frontmatter);
+    let yaml_result: Result<serde_yaml_ng::Value, _> = serde_yaml_ng::from_str(frontmatter);
     assert!(yaml_result.is_ok(), "Frontmatter should be valid YAML: {:?}", yaml_result.err());
 
     // Check for Steps section

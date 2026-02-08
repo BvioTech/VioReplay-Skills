@@ -203,6 +203,9 @@ function App() {
 
   // Recordings list
   const [recordings, setRecordings] = useState<RecordingInfo[]>([]);
+  const [loadingRecordings, setLoadingRecordings] = useState(false);
+  const [loadingSkills, setLoadingSkills] = useState(false);
+  const [savingConfig, setSavingConfig] = useState(false);
 
   // UI state
   const [error, setError] = useState<string | null>(null);
@@ -316,12 +319,15 @@ function App() {
   }
 
   async function loadRecordings() {
+    setLoadingRecordings(true);
     try {
       const list = await invoke<RecordingInfo[]>("list_recordings");
       setRecordings(list);
     } catch (e) {
       console.error("Failed to load recordings:", e);
       setError("Failed to load recordings");
+    } finally {
+      setLoadingRecordings(false);
     }
   }
 
@@ -344,11 +350,14 @@ function App() {
   }
 
   async function loadSkills() {
+    setLoadingSkills(true);
     try {
       const list = await invoke<SkillListEntry[]>("list_generated_skills");
       setSkills(list);
     } catch (e) {
       console.error("Failed to load skills:", e);
+    } finally {
+      setLoadingSkills(false);
     }
   }
 
@@ -431,14 +440,17 @@ function App() {
   }
 
   async function handleSaveConfig() {
-    if (!config) return;
+    if (!config || savingConfig) return;
     setError(null);
+    setSavingConfig(true);
     try {
       await invoke("save_config", { config });
       setSuccess("Configuration saved");
     } catch (e: unknown) {
       const errorMsg = e instanceof Error ? e.message : String(e);
       setError(errorMsg);
+    } finally {
+      setSavingConfig(false);
     }
   }
 
@@ -761,11 +773,13 @@ function App() {
           <section className="panel">
             <h2 className="panel-title">
               Recordings
-              <button className="btn btn-tiny" onClick={() => loadRecordings()} title="Refresh">
-                Refresh
+              <button className="btn btn-tiny" onClick={() => loadRecordings()} title="Refresh" disabled={loadingRecordings}>
+                {loadingRecordings ? "Loading..." : "Refresh"}
               </button>
             </h2>
-            {recordings.length === 0 ? (
+            {loadingRecordings && recordings.length === 0 ? (
+              <div className="empty-state"><p>Loading recordings...</p></div>
+            ) : recordings.length === 0 ? (
               <div className="empty-state">
                 <p>No recordings yet</p>
                 <p className="empty-hint">
@@ -882,11 +896,13 @@ function App() {
           <section className="panel">
             <h2 className="panel-title">
               Generated Skills
-              <button className="btn btn-tiny" onClick={() => loadSkills()} title="Refresh">
-                Refresh
+              <button className="btn btn-tiny" onClick={() => loadSkills()} title="Refresh" disabled={loadingSkills}>
+                {loadingSkills ? "Loading..." : "Refresh"}
               </button>
             </h2>
-            {skills.length === 0 ? (
+            {loadingSkills && skills.length === 0 ? (
+              <div className="empty-state"><p>Loading skills...</p></div>
+            ) : skills.length === 0 ? (
               <div className="empty-state">
                 <p>No skills generated yet</p>
                 <p className="empty-hint">
@@ -1097,8 +1113,8 @@ function App() {
                   <span className="config-hint">Track window/app focus changes during generation</span>
                 </label>
 
-                <button className="btn btn-primary" onClick={handleSaveConfig}>
-                  Save Configuration
+                <button className="btn btn-primary" onClick={handleSaveConfig} disabled={savingConfig}>
+                  {savingConfig ? "Saving..." : "Save Configuration"}
                 </button>
               </div>
             </section>

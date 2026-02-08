@@ -499,7 +499,10 @@ fn find_toml_value<'a>(toml_str: &'a str, key: &str) -> Option<&'a str> {
 /// Simple TOML value setter by dotted key
 fn set_toml_value(toml_str: &mut String, key: &str, value: &str) -> bool {
     let parts: Vec<&str> = key.split('.').collect();
-    let leaf_key = parts.last().unwrap();
+    let leaf_key = match parts.last() {
+        Some(k) => k,
+        None => return false,
+    };
 
     let section_name = if parts.len() > 1 { parts[0] } else { "" };
     let mut in_section = parts.len() == 1;

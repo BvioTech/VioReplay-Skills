@@ -105,14 +105,21 @@ impl RdpSimplifier {
             left
         } else {
             // All points are within epsilon of the line, keep only endpoints
-            vec![points[0], *points.last().unwrap()]
+            // Safety: points.len() > 2 is guaranteed by the early return above
+            match (points.first(), points.last()) {
+                (Some(&first), Some(&last)) => vec![first, last],
+                _ => points.to_vec(),
+            }
         }
     }
 
     /// Find the point with maximum perpendicular distance from the line
     fn find_max_distance(&self, points: &[TrajectoryPoint]) -> (f64, usize) {
         let start = &points[0];
-        let end = points.last().unwrap();
+        let end = match points.last() {
+            Some(p) => p,
+            None => return (0.0, 0),
+        };
 
         let mut max_dist = 0.0;
         let mut max_index = 0;
@@ -199,7 +206,7 @@ impl SimplifiedTrajectory {
         }
 
         let start = &self.points[0];
-        let end = self.points.last().unwrap();
+        let end = self.points.last()?;
 
         let dx = end.x - start.x;
         let dy = end.y - start.y;

@@ -469,4 +469,115 @@ include_screenshots = false
         let result = Config::load(&config_path);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_pipeline_config_serialization_roundtrip() {
+        let pipeline = PipelineConfig {
+            use_action_clustering: false,
+            use_local_recovery: true,
+            use_vision_ocr: false,
+            use_trajectory_analysis: true,
+            use_goms_detection: false,
+            use_context_tracking: true,
+        };
+
+        let toml_str = toml::to_string_pretty(&pipeline).expect("Failed to serialize PipelineConfig");
+        let deserialized: PipelineConfig = toml::from_str(&toml_str).expect("Failed to deserialize PipelineConfig");
+
+        assert_eq!(deserialized.use_action_clustering, false);
+        assert_eq!(deserialized.use_local_recovery, true);
+        assert_eq!(deserialized.use_vision_ocr, false);
+        assert_eq!(deserialized.use_trajectory_analysis, true);
+        assert_eq!(deserialized.use_goms_detection, false);
+        assert_eq!(deserialized.use_context_tracking, true);
+    }
+
+    #[test]
+    fn test_config_with_custom_pipeline_roundtrip() {
+        let config = Config {
+            capture: CaptureConfig {
+                ring_buffer_size: 4096,
+                sampling_rate_hz: 5,
+                vision_fallback: false,
+            },
+            analysis: AnalysisConfig {
+                rdp_epsilon_px: 5.0,
+                hesitation_threshold: 0.5,
+                min_pause_ms: 200,
+            },
+            codegen: CodegenConfig {
+                model: "claude-sonnet-4-5-20250929".to_string(),
+                temperature: 1.0,
+                include_screenshots: true,
+            },
+            pipeline: PipelineConfig {
+                use_action_clustering: false,
+                use_local_recovery: false,
+                use_vision_ocr: false,
+                use_trajectory_analysis: true,
+                use_goms_detection: true,
+                use_context_tracking: false,
+            },
+        };
+
+        let toml_str = config.to_toml().expect("Failed to serialize Config");
+        assert!(toml_str.contains("[pipeline]"));
+        assert!(toml_str.contains("use_action_clustering = false"));
+        assert!(toml_str.contains("use_context_tracking = false"));
+
+        let deserialized: Config = toml::from_str(&toml_str).expect("Failed to deserialize Config");
+        assert_eq!(deserialized.capture.ring_buffer_size, 4096);
+        assert_eq!(deserialized.capture.sampling_rate_hz, 5);
+        assert_eq!(deserialized.capture.vision_fallback, false);
+        assert_eq!(deserialized.analysis.rdp_epsilon_px, 5.0);
+        assert_eq!(deserialized.analysis.hesitation_threshold, 0.5);
+        assert_eq!(deserialized.analysis.min_pause_ms, 200);
+        assert_eq!(deserialized.codegen.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(deserialized.codegen.temperature, 1.0);
+        assert_eq!(deserialized.codegen.include_screenshots, true);
+        assert_eq!(deserialized.pipeline.use_action_clustering, false);
+        assert_eq!(deserialized.pipeline.use_local_recovery, false);
+        assert_eq!(deserialized.pipeline.use_vision_ocr, false);
+        assert_eq!(deserialized.pipeline.use_trajectory_analysis, true);
+        assert_eq!(deserialized.pipeline.use_goms_detection, true);
+        assert_eq!(deserialized.pipeline.use_context_tracking, false);
+    }
+
+    #[test]
+    fn test_old_config_without_pipeline_section_deserializes() {
+        // Simulate a legacy config file that does not include a [pipeline] section.
+        // Because PipelineConfig has #[serde(default)], it should use default values.
+        let old_config_toml = r#"
+[capture]
+ring_buffer_size = 8192
+sampling_rate_hz = 0
+vision_fallback = true
+
+[analysis]
+rdp_epsilon_px = 3.0
+hesitation_threshold = 0.7
+min_pause_ms = 300
+
+[codegen]
+model = "claude-sonnet-4-5-20250929"
+temperature = 0.3
+include_screenshots = false
+"#;
+
+        let config: Config = toml::from_str(old_config_toml)
+            .expect("Old config without [pipeline] should deserialize successfully");
+
+        // Capture/analysis/codegen should match the TOML values
+        assert_eq!(config.capture.ring_buffer_size, 8192);
+        assert_eq!(config.analysis.rdp_epsilon_px, 3.0);
+        assert_eq!(config.codegen.model, "claude-sonnet-4-5-20250929");
+
+        // Pipeline should use defaults (all true)
+        assert!(config.pipeline.use_action_clustering);
+        assert!(config.pipeline.use_local_recovery);
+        assert!(config.pipeline.use_vision_ocr);
+        assert!(config.pipeline.use_trajectory_analysis);
+        assert!(config.pipeline.use_goms_detection);
+        assert!(config.pipeline.use_context_tracking);
+    }
 }

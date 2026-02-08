@@ -2623,4 +2623,209 @@ mod tests {
         assert!(result[0].confidence > 0.8);
         assert!((result[0].confidence - 0.85).abs() < 0.01);
     }
+
+    #[test]
+    fn test_pipeline_stats_default_values() {
+        let stats = PipelineStats::default();
+        assert_eq!(stats.local_recovery_count, 0);
+        assert_eq!(stats.llm_enriched_count, 0);
+        assert_eq!(stats.goms_boundaries_count, 0);
+        assert_eq!(stats.context_transitions_count, 0);
+        assert_eq!(stats.unit_tasks_count, 0);
+        assert_eq!(stats.significant_events_count, 0);
+        assert_eq!(stats.trajectory_adjustments_count, 0);
+        assert_eq!(stats.variables_count, 0);
+        assert_eq!(stats.generated_steps_count, 0);
+    }
+
+    #[test]
+    fn test_generate_populates_stats_significant_and_steps() {
+        MachTimebase::init();
+        let config = GeneratorConfig {
+            include_verification: false,
+            extract_variables: false,
+            use_llm_semantic: false,
+            use_action_clustering: false,
+            use_local_recovery: false,
+            use_trajectory_analysis: false,
+            use_goms_detection: false,
+            use_context_tracking: false,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let mut recording = Recording::new("stats_test".to_string(), Some("Test stats".to_string()));
+
+        // Add a click event with semantic context
+        let mut click = make_test_event(EventType::LeftMouseDown, 100.0, 200.0);
+        click.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("OK".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click);
+
+        // Add a key event
+        recording.add_event(make_test_event_with_modifiers(
+            EventType::KeyDown, 0.0, 0.0,
+            ModifierFlags::default(), None, Some('x'),
+        ));
+
+        let skill = generator.generate(&recording).unwrap();
+
+        assert!(skill.stats.significant_events_count > 0, "significant_events_count should be > 0");
+        assert!(skill.stats.generated_steps_count > 0, "generated_steps_count should be > 0");
+        // With all optional features disabled, these should be zero
+        assert_eq!(skill.stats.local_recovery_count, 0);
+        assert_eq!(skill.stats.llm_enriched_count, 0);
+        assert_eq!(skill.stats.goms_boundaries_count, 0);
+        assert_eq!(skill.stats.context_transitions_count, 0);
+        assert_eq!(skill.stats.unit_tasks_count, 0);
+        assert_eq!(skill.stats.trajectory_adjustments_count, 0);
+    }
+
+    #[test]
+    fn test_goms_disabled_gives_zero_goms_stats() {
+        MachTimebase::init();
+        let config = GeneratorConfig {
+            include_verification: false,
+            extract_variables: false,
+            use_llm_semantic: false,
+            use_action_clustering: false,
+            use_local_recovery: false,
+            use_trajectory_analysis: false,
+            use_goms_detection: false,
+            use_context_tracking: false,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let mut recording = Recording::new("no_goms_stats_test".to_string(), None);
+
+        let mut click = make_test_event(EventType::LeftMouseDown, 100.0, 100.0);
+        click.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Submit".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click);
+
+        let skill = generator.generate(&recording).unwrap();
+        assert_eq!(skill.stats.goms_boundaries_count, 0, "goms_boundaries_count should be 0 when goms disabled");
+    }
+
+    #[test]
+    fn test_context_tracking_disabled_gives_zero_context_stats() {
+        MachTimebase::init();
+        let config = GeneratorConfig {
+            include_verification: false,
+            extract_variables: false,
+            use_llm_semantic: false,
+            use_action_clustering: false,
+            use_local_recovery: false,
+            use_trajectory_analysis: false,
+            use_goms_detection: false,
+            use_context_tracking: false,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let mut recording = Recording::new("no_context_stats_test".to_string(), None);
+
+        let mut click = make_test_event(EventType::LeftMouseDown, 100.0, 100.0);
+        click.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("OK".to_string()),
+            app_bundle_id: Some("com.test.App".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click);
+
+        let skill = generator.generate(&recording).unwrap();
+        assert_eq!(skill.stats.context_transitions_count, 0, "context_transitions_count should be 0 when tracking disabled");
+    }
+
+    #[test]
+    fn test_action_clustering_disabled_gives_zero_unit_tasks_stats() {
+        MachTimebase::init();
+        let config = GeneratorConfig {
+            include_verification: false,
+            extract_variables: false,
+            use_llm_semantic: false,
+            use_action_clustering: false,
+            use_local_recovery: false,
+            use_trajectory_analysis: false,
+            use_goms_detection: false,
+            use_context_tracking: false,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let mut recording = Recording::new("no_clustering_stats_test".to_string(), None);
+
+        let mut click = make_test_event(EventType::LeftMouseDown, 100.0, 100.0);
+        click.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Submit".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click);
+
+        let skill = generator.generate(&recording).unwrap();
+        assert_eq!(skill.stats.unit_tasks_count, 0, "unit_tasks_count should be 0 when clustering disabled");
+    }
+
+    #[test]
+    fn test_trajectory_analysis_disabled_gives_zero_trajectory_stats() {
+        MachTimebase::init();
+        let config = GeneratorConfig {
+            include_verification: false,
+            extract_variables: false,
+            use_llm_semantic: false,
+            use_action_clustering: false,
+            use_local_recovery: false,
+            use_trajectory_analysis: false,
+            use_goms_detection: false,
+            use_context_tracking: false,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let mut recording = Recording::new("no_trajectory_stats_test".to_string(), None);
+
+        let mut click = make_test_event(EventType::LeftMouseDown, 100.0, 100.0);
+        click.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Target".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click);
+
+        let skill = generator.generate(&recording).unwrap();
+        assert_eq!(skill.stats.trajectory_adjustments_count, 0, "trajectory_adjustments_count should be 0 when trajectory analysis disabled");
+    }
+
+    #[test]
+    fn test_variables_disabled_gives_zero_variables_stats() {
+        MachTimebase::init();
+        let config = GeneratorConfig {
+            include_verification: false,
+            extract_variables: false,
+            use_llm_semantic: false,
+            use_action_clustering: false,
+            use_local_recovery: false,
+            use_trajectory_analysis: false,
+            use_goms_detection: false,
+            use_context_tracking: false,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let mut recording = Recording::new("no_vars_stats_test".to_string(), None);
+
+        let mut click = make_test_event(EventType::LeftMouseDown, 100.0, 100.0);
+        click.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Button".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click);
+
+        let skill = generator.generate(&recording).unwrap();
+        assert_eq!(skill.stats.variables_count, 0, "variables_count should be 0 when extract_variables disabled");
+    }
 }
