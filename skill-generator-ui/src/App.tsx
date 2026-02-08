@@ -439,7 +439,7 @@ function App() {
       setSuccess(`Recording saved: ${info.name} (${info.event_count} events)`);
       setRecordingName("");
       setGoal("");
-      loadRecordings();
+      await loadRecordings();
       setActiveTab("recordings");
     } catch (e: unknown) {
       const errorMsg = e instanceof Error ? e.message : String(e);
@@ -461,7 +461,7 @@ function App() {
       setSuccess(`SKILL.md generated: ${skill.name} (${skill.steps_count} steps, ${skill.variables_count} variables)`);
       setPipelineStats(skill.stats);
       setGeneratedSkills(prev => ({ ...prev, [recordingPath]: skill.path }));
-      loadSkills();
+      await loadSkills();
 
       // Load preview
       const content = await readSkillFile(skill.path);
@@ -598,7 +598,7 @@ function App() {
         const tomlContent = await file.text();
         await invoke("import_config", { tomlContent });
         setSuccess("Config imported successfully");
-        loadConfig();
+        await loadConfig();
       } catch (e: unknown) {
         const errorMsg = e instanceof Error ? e.message : String(e);
         setError(`Failed to import config: ${errorMsg}`);
