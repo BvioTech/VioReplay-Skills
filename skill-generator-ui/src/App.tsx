@@ -1325,7 +1325,7 @@ function App() {
             </p>
             <div className="about-meta">
               <span>v0.1.0</span>
-              <span>650 tests passing</span>
+              <span>688 tests passing</span>
             </div>
           </section>
         </div>
