@@ -13,6 +13,7 @@ use super::types::{CursorState, EventType, ModifierFlags, RawEvent};
 use crate::time::timebase::{MachTimebase, Timestamp};
 use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
 use core_foundation::runloop::kCFRunLoopCommonModes;
+use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
@@ -161,12 +162,21 @@ struct CGPoint {
     y: f64,
 }
 
-/// Thread-safe context for the event tap callback
+/// Context for the event tap callback.
+///
+/// Safety: The `producer` field uses UnsafeCell because the EventProducer (rtrb::Producer)
+/// is `!Sync`, but we guarantee single-thread access: the callback only runs on the
+/// dedicated CFRunLoop thread. This avoids Mutex overhead in the real-time event path.
 struct EventTapContext {
-    producer: std::sync::Mutex<EventProducer>,
+    producer: UnsafeCell<EventProducer>,
     running: Arc<AtomicBool>,
     event_count: std::sync::atomic::AtomicU64,
 }
+
+// Safety: EventTapContext is only accessed from the CFRunLoop thread (via the callback)
+// and from the main thread (to create/destroy it, never concurrently with the callback).
+// The UnsafeCell<EventProducer> is only accessed in the callback on the CFRunLoop thread.
+unsafe impl Sync for EventTapContext {}
 
 /// Global context pointer for the callback
 /// This is necessary because CGEventTapCreate's callback can't capture Rust closures
@@ -220,7 +230,7 @@ impl EventTap {
 
         // Create context
         let context = Box::new(EventTapContext {
-            producer: std::sync::Mutex::new(producer),
+            producer: UnsafeCell::new(producer),
             running: Arc::clone(&self.running),
             event_count: std::sync::atomic::AtomicU64::new(0),
         });
@@ -385,24 +395,57 @@ extern "C" fn event_tap_callback(
         click_count,
     };
 
-    // Push to ring buffer (lock-free from producer's perspective)
-    if let Ok(mut producer) = context.producer.lock() {
-        if producer.push(raw_event) {
-            context.event_count.fetch_add(1, Ordering::Relaxed);
-            trace!(
-                "Captured {:?} at ({:.1}, {:.1})",
-                our_event_type,
-                location.x,
-                location.y
-            );
-        } else {
-            // Buffer full - this is logged but not an error
-            trace!("Ring buffer full, dropping event");
-        }
+    // Push to ring buffer (lock-free, no Mutex needed - callback runs on single CFRunLoop thread)
+    // Safety: UnsafeCell access is safe because the callback is only invoked on the
+    // dedicated CFRunLoop thread, guaranteeing single-threaded access to the producer.
+    let producer = unsafe { &mut *context.producer.get() };
+    if producer.push(raw_event) {
+        context.event_count.fetch_add(1, Ordering::Relaxed);
+        trace!(
+            "Captured {:?} at ({:.1}, {:.1})",
+            our_event_type,
+            location.x,
+            location.y
+        );
+    } else {
+        // Buffer full - this is logged but not an error
+        trace!("Ring buffer full, dropping event");
     }
 
     // Return the event unchanged (we're listen-only)
     event
+}
+
+/// RAII guard for a CGEventTap handle. Disables and releases the tap on drop.
+struct EventTapGuard(CFTypeRef);
+
+impl Drop for EventTapGuard {
+    fn drop(&mut self) {
+        unsafe {
+            CGEventTapEnable(self.0, false);
+            CFRelease(self.0);
+        }
+    }
+}
+
+/// RAII guard for a CFRunLoopSource. Releases the source on drop.
+struct RunLoopSourceGuard(CFTypeRef);
+
+impl Drop for RunLoopSourceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            CFRelease(self.0);
+        }
+    }
+}
+
+/// RAII guard that clears RUN_LOOP_PTR on drop.
+struct RunLoopPtrGuard;
+
+impl Drop for RunLoopPtrGuard {
+    fn drop(&mut self) {
+        RUN_LOOP_PTR.store(ptr::null_mut(), Ordering::SeqCst);
+    }
 }
 
 /// Run the event tap loop
@@ -430,21 +473,25 @@ fn run_event_tap_loop(_running: Arc<AtomicBool>) -> Result<(), crate::Error> {
         ));
     }
 
+    // RAII guard: disables and releases tap on any exit (including panic)
+    let _tap_guard = EventTapGuard(tap);
+
     // Create run loop source
     let run_loop_source = unsafe { CFMachPortCreateRunLoopSource(ptr::null(), tap, 0) };
 
     if run_loop_source.is_null() {
-        unsafe {
-            CFRelease(tap);
-        }
         return Err(crate::Error::Capture(
             "Failed to create run loop source".into(),
         ));
     }
 
+    // RAII guard: releases source on any exit
+    let _source_guard = RunLoopSourceGuard(run_loop_source);
+
     // Get current run loop and store for stopping
     let run_loop = unsafe { CFRunLoopGetCurrent() };
     RUN_LOOP_PTR.store(run_loop as *mut c_void, Ordering::SeqCst);
+    let _ptr_guard = RunLoopPtrGuard;
 
     // Add source to run loop
     unsafe {
@@ -468,14 +515,7 @@ fn run_event_tap_loop(_running: Arc<AtomicBool>) -> Result<(), crate::Error> {
         CFRunLoopRun();
     }
 
-    // Cleanup
-    unsafe {
-        CGEventTapEnable(tap, false);
-        CFRelease(run_loop_source);
-        CFRelease(tap);
-    }
-
-    RUN_LOOP_PTR.store(ptr::null_mut(), Ordering::SeqCst);
+    // Guards handle cleanup automatically via Drop
 
     info!("Event tap loop stopped");
     Ok(())

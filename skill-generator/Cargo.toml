@@ -62,8 +62,8 @@ regex = "1"
 # Signal handling
 ctrlc = "3"
 
-# HTTP client for Claude API
-reqwest = { version = "0.12", features = ["json"] }
+# HTTP client for Claude API (rustls avoids duplicate core-foundation versions from native-tls)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
