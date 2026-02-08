@@ -251,8 +251,7 @@ fn test_variable_extraction_phone_number() {
 
     // Phone number detection may depend on entropy threshold and detection logic
     // This test validates the extraction mechanism exists and works for high-entropy strings
-    if phone_var.is_some() {
-        let var = phone_var.unwrap();
+    if let Some(var) = phone_var {
         assert!(var.detected_value.contains("555"), "Extracted variable should contain the phone number");
     } else {
         // If not detected as phone, it may be detected as high-entropy user_input
@@ -797,7 +796,10 @@ fn test_chunking_respects_time_gaps() {
 #[test]
 fn test_chunking_form_fill_workflow() {
     MachTimebase::init();
-    let generator = SkillGenerator::new();
+    let generator = SkillGenerator::with_config(skill_generator::workflow::generator::GeneratorConfig {
+        use_action_clustering: false,
+        ..Default::default()
+    });
 
     let mut recording = Recording::new("form_fill".to_string(), Some("Fill out contact form".to_string()));
 

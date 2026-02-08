@@ -4,7 +4,7 @@
 //! Event generation -> Ring buffer -> Semantic backfill -> Processed store
 
 use skill_generator::capture::ring_buffer::{
-    EventRingBuffer, ProcessedEventStore, RingBufferStats,
+    EventRingBuffer, ProcessedEventStore,
 };
 use skill_generator::capture::types::{
     CursorState, EnrichedEvent, EventType, ModifierFlags, RawEvent, SemanticContext,
@@ -48,22 +48,6 @@ fn make_click_event(x: f64, y: f64, click_count: u8) -> RawEvent {
     }
 }
 
-/// Create a test keyboard event
-fn make_key_event(key_code: u16, character: char, modifiers: ModifierFlags) -> RawEvent {
-    MachTimebase::init();
-    RawEvent {
-        timestamp: Timestamp::now(),
-        event_type: EventType::KeyDown,
-        coordinates: (0.0, 0.0),
-        cursor_state: CursorState::IBeam,
-        key_code: Some(key_code),
-        character: Some(character),
-        modifiers,
-        scroll_delta: None,
-        click_count: 0,
-    }
-}
-
 #[test]
 fn test_ring_buffer_spsc_flow() {
     MachTimebase::init();
@@ -99,7 +83,7 @@ fn test_ring_buffer_spsc_flow() {
 fn test_concurrent_producer_consumer() {
     MachTimebase::init();
     let buffer = EventRingBuffer::with_capacity(256);
-    let stats = buffer.stats();
+    let _stats = buffer.stats();
     let (mut producer, mut consumer) = buffer.split();
 
     let event_count = 100;
@@ -329,7 +313,7 @@ fn test_high_frequency_event_capture() {
 
     // Consume all events
     let mut consumed = 0;
-    while let Some(_) = consumer.pop() {
+    while consumer.pop().is_some() {
         consumed += 1;
     }
     assert_eq!(consumed, event_count);

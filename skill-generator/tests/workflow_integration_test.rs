@@ -163,7 +163,11 @@ fn test_single_click_workflow() {
 #[test]
 fn test_multi_step_workflow() {
     MachTimebase::init();
-    let generator = SkillGenerator::new();
+    let config = skill_generator::workflow::generator::GeneratorConfig {
+        use_action_clustering: false,
+        ..Default::default()
+    };
+    let generator = SkillGenerator::with_config(config);
     let mut recording = Recording::new(
         "multi_step".to_string(),
         Some("Fill form and submit".to_string()),
@@ -294,7 +298,13 @@ fn test_malformed_event_handling() {
     let raw = make_raw_event(EventType::LeftMouseDown, 0.0, 0.0);
     recording.add_event(make_enriched_event(raw, None));
 
-    let generator = SkillGenerator::new();
+    let config = skill_generator::workflow::generator::GeneratorConfig {
+        use_action_clustering: false,
+        use_local_recovery: false,
+        use_llm_semantic: false,
+        ..Default::default()
+    };
+    let generator = SkillGenerator::with_config(config);
     let skill = generator.generate(&recording).expect("Should handle missing semantic gracefully");
 
     // Should still generate a step with fallback data using coordinates
@@ -321,7 +331,11 @@ fn test_boundary_coordinates() {
     recording.add_raw_event(make_raw_event(EventType::LeftMouseDown, 9999.0, 9999.0));
     recording.add_raw_event(make_raw_event(EventType::LeftMouseDown, -100.0, -100.0));
 
-    let generator = SkillGenerator::new();
+    let config = skill_generator::workflow::generator::GeneratorConfig {
+        use_action_clustering: false,
+        ..Default::default()
+    };
+    let generator = SkillGenerator::with_config(config);
     let skill = generator.generate(&recording).expect("Should handle boundary coordinates");
 
     assert_eq!(skill.steps.len(), 3);
@@ -346,7 +360,11 @@ fn test_large_event_sequence() {
     }
     recording.finalize(60000);
 
-    let generator = SkillGenerator::new();
+    let config = skill_generator::workflow::generator::GeneratorConfig {
+        use_action_clustering: false,
+        ..Default::default()
+    };
+    let generator = SkillGenerator::with_config(config);
     let skill = generator.generate(&recording).expect("Should handle large sequences");
 
     assert_eq!(skill.steps.len(), 1000);
@@ -366,10 +384,17 @@ fn test_special_characters_in_input() {
         recording.add_raw_event(make_keyboard_event(ch));
     }
 
-    let generator = SkillGenerator::new();
+    let config = skill_generator::workflow::generator::GeneratorConfig {
+        use_action_clustering: false,
+        ..Default::default()
+    };
+    let generator = SkillGenerator::with_config(config);
     let skill = generator.generate(&recording).expect("Should handle special characters");
 
-    assert_eq!(skill.steps.len(), special_chars.len());
+    // Consecutive Type actions are consolidated into a single step
+    assert_eq!(skill.steps.len(), 1);
+    // The consolidated step should contain all special characters
+    assert!(skill.steps[0].description.contains("Type"), "Step should be a Type action");
 }
 
 // ============================================================================
@@ -628,7 +653,7 @@ fn test_variable_extractor_email_detection() {
     // Should detect email variable
     assert!(!variables.is_empty(), "Should extract email variable");
     let has_email = variables.iter().any(|v|
-        v.type_hint.as_ref().map_or(false, |t| t == "email")
+        v.type_hint.as_ref().is_some_and(|t| t == "email")
     );
     assert!(has_email, "Should identify email type");
 }
@@ -640,7 +665,11 @@ fn test_variable_extractor_email_detection() {
 #[test]
 fn test_complex_form_workflow() {
     MachTimebase::init();
-    let generator = SkillGenerator::new();
+    let config = skill_generator::workflow::generator::GeneratorConfig {
+        use_action_clustering: false,
+        ..Default::default()
+    };
+    let generator = SkillGenerator::with_config(config);
     let mut recording = Recording::new(
         "form_test".to_string(),
         Some("Fill registration form".to_string()),

@@ -416,7 +416,7 @@ fn test_skill_generation_latency() {
                 );
                 recording.add_event(event);
             } else {
-                let c = ('a' as u8 + (i % 26) as u8) as char;
+                let c = (b'a' + (i % 26) as u8) as char;
                 let event = make_key_event(c, c as u16);
                 recording.add_event(event);
             }
@@ -717,8 +717,8 @@ fn test_concurrent_access() {
     );
 
     // Verify no data loss
-    let stats_pushed = (*stats).events_pushed.load(Ordering::Relaxed);
-    let stats_dropped = (*stats).events_dropped.load(Ordering::Relaxed);
+    let stats_pushed = stats.events_pushed.load(Ordering::Relaxed);
+    let stats_dropped = stats.events_dropped.load(Ordering::Relaxed);
 
     assert_eq!(
         stats_pushed as usize, total_expected,

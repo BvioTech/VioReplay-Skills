@@ -860,8 +860,10 @@ mod tests {
     fn test_create_raw_event_with_keyboard_data() {
         MachTimebase::init();
 
-        let mut modifiers = ModifierFlags::default();
-        modifiers.shift = true;
+        let modifiers = ModifierFlags {
+            shift: true,
+            ..Default::default()
+        };
 
         let event = create_raw_event(
             EventType::KeyDown,

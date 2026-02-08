@@ -911,9 +911,11 @@ mod tests {
             1,
         );
 
-        let mut semantic = SemanticContext::default();
-        semantic.ax_role = Some("AXButton".to_string());
-        semantic.title = Some("Submit".to_string());
+        let semantic = SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Submit".to_string()),
+            ..Default::default()
+        };
 
         let event = EnrichedEvent::new(raw, 0).with_semantic(semantic);
 
@@ -957,9 +959,11 @@ mod tests {
             (100.0, 200.0),
         );
 
-        let mut semantic = SemanticContext::default();
-        semantic.ax_role = Some("AXTextField".to_string());
-        semantic.title = Some("Email".to_string());
+        let semantic = SemanticContext {
+            ax_role: Some("AXTextField".to_string()),
+            title: Some("Email".to_string()),
+            ..Default::default()
+        };
 
         let event = EnrichedEvent::new(raw, 0).with_semantic(semantic);
 
@@ -1083,8 +1087,10 @@ mod tests {
                 1,
             );
 
-            let mut semantic = SemanticContext::default();
-            semantic.ax_role = Some("AXButton".to_string());
+            let semantic = SemanticContext {
+                ax_role: Some("AXButton".to_string()),
+                ..Default::default()
+            };
 
             let event = EnrichedEvent::new(raw, i).with_semantic(semantic);
 
@@ -1339,8 +1345,10 @@ mod tests {
             1,
         );
 
-        let mut semantic1 = SemanticContext::default();
-        semantic1.ax_role = Some("AXButton".to_string());
+        let semantic1 = SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            ..Default::default()
+        };
 
         let event1 = EnrichedEvent::new(raw1, 0).with_semantic(semantic1);
 
@@ -1370,8 +1378,10 @@ mod tests {
             1,
         );
 
-        let mut semantic2 = SemanticContext::default();
-        semantic2.ax_role = Some("AXButton".to_string());
+        let semantic2 = SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            ..Default::default()
+        };
 
         let event2 = EnrichedEvent::new(raw2, 1).with_semantic(semantic2);
 

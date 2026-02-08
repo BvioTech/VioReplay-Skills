@@ -557,7 +557,7 @@ mod tests {
     #[test]
     fn test_ax_error_codes() {
         assert_eq!(K_AX_ERROR_SUCCESS, 0);
-        assert!(K_AX_ERROR_CANNOT_COMPLETE < 0);
+        assert_eq!(K_AX_ERROR_CANNOT_COMPLETE, -25204);
     }
 
     #[test]
@@ -786,23 +786,22 @@ mod tests {
 
     #[test]
     fn test_semantic_context_building() {
-        let mut context = SemanticContext::default();
-
         // Build a complete semantic context
-        context.ax_role = Some("AXButton".to_string());
-        context.title = Some("Submit".to_string());
-        context.identifier = Some("submit-btn".to_string());
-        context.value = Some("enabled".to_string());
-        context.parent_role = Some("AXGroup".to_string());
-        context.parent_title = Some("Form".to_string());
-        context.window_title = Some("Registration".to_string());
-        context.app_bundle_id = Some("com.example.app".to_string());
-        context.app_name = Some("Example App".to_string());
-        context.pid = Some(1234);
-        context.window_id = Some(5678);
-        context.frame = Some((100.0, 200.0, 50.0, 30.0));
-        context.source = SemanticSource::Accessibility;
-        context.confidence = 1.0;
+        let context = SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Submit".to_string()),
+            identifier: Some("submit-btn".to_string()),
+            value: Some("enabled".to_string()),
+            parent_role: Some("AXGroup".to_string()),
+            parent_title: Some("Form".to_string()),
+            window_title: Some("Registration".to_string()),
+            app_bundle_id: Some("com.example.app".to_string()),
+            app_name: Some("Example App".to_string()),
+            pid: Some(1234),
+            window_id: Some(5678),
+            frame: Some((100.0, 200.0, 50.0, 30.0)),
+            ..Default::default()
+        };
 
         // Verify all fields are set correctly
         assert_eq!(context.ax_role, Some("AXButton".to_string()));
@@ -856,10 +855,12 @@ mod tests {
 
     #[test]
     fn test_semantic_context_ocr_text() {
-        let mut context = SemanticContext::default();
-        context.source = SemanticSource::Vision;
-        context.ocr_text = Some("Hello World".to_string());
-        context.confidence = 0.8;
+        let context = SemanticContext {
+            source: SemanticSource::Vision,
+            ocr_text: Some("Hello World".to_string()),
+            confidence: 0.8,
+            ..Default::default()
+        };
 
         assert_eq!(context.source, SemanticSource::Vision);
         assert_eq!(context.ocr_text, Some("Hello World".to_string()));
@@ -883,44 +884,51 @@ mod tests {
 
     #[test]
     fn test_semantic_context_with_frame_bounds() {
-        let mut context = SemanticContext::default();
-
         // Test various frame configurations
-        context.frame = Some((0.0, 0.0, 100.0, 100.0)); // Top-left origin
-        assert_eq!(context.frame, Some((0.0, 0.0, 100.0, 100.0)));
+        let context_top_left = SemanticContext {
+            frame: Some((0.0, 0.0, 100.0, 100.0)), // Top-left origin
+            ..Default::default()
+        };
+        assert_eq!(context_top_left.frame, Some((0.0, 0.0, 100.0, 100.0)));
 
-        context.frame = Some((1920.0, 1080.0, 200.0, 150.0)); // Bottom-right
-        assert_eq!(context.frame, Some((1920.0, 1080.0, 200.0, 150.0)));
+        let context_bottom_right = SemanticContext {
+            frame: Some((1920.0, 1080.0, 200.0, 150.0)), // Bottom-right
+            ..Default::default()
+        };
+        assert_eq!(context_bottom_right.frame, Some((1920.0, 1080.0, 200.0, 150.0)));
 
-        context.frame = Some((0.5, 0.5, 1.5, 1.5)); // Fractional coordinates
-        assert_eq!(context.frame, Some((0.5, 0.5, 1.5, 1.5)));
+        let context_fractional = SemanticContext {
+            frame: Some((0.5, 0.5, 1.5, 1.5)), // Fractional coordinates
+            ..Default::default()
+        };
+        assert_eq!(context_fractional.frame, Some((0.5, 0.5, 1.5, 1.5)));
     }
 
     #[test]
     fn test_semantic_context_confidence_range() {
-        let mut context = SemanticContext::default();
-
         // Test various confidence levels
-        context.confidence = 1.0;
-        assert_eq!(context.confidence, 1.0);
+        let context_full = SemanticContext { confidence: 1.0, ..Default::default() };
+        assert_eq!(context_full.confidence, 1.0);
 
-        context.confidence = 0.9;
-        assert_eq!(context.confidence, 0.9);
+        let context_high = SemanticContext { confidence: 0.9, ..Default::default() };
+        assert_eq!(context_high.confidence, 0.9);
 
-        context.confidence = 0.5;
-        assert_eq!(context.confidence, 0.5);
+        let context_mid = SemanticContext { confidence: 0.5, ..Default::default() };
+        assert_eq!(context_mid.confidence, 0.5);
 
-        context.confidence = 0.0;
-        assert_eq!(context.confidence, 0.0);
+        let context_zero = SemanticContext { confidence: 0.0, ..Default::default() };
+        assert_eq!(context_zero.confidence, 0.0);
     }
 
     #[test]
     fn test_semantic_context_serialization() {
-        let mut context = SemanticContext::default();
-        context.ax_role = Some("AXButton".to_string());
-        context.title = Some("Click Me".to_string());
-        context.confidence = 0.95;
-        context.ancestors.push(("AXWindow".to_string(), Some("Main".to_string())));
+        let context = SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Click Me".to_string()),
+            confidence: 0.95,
+            ancestors: vec![("AXWindow".to_string(), Some("Main".to_string()))],
+            ..Default::default()
+        };
 
         // Test serialization
         let serialized = serde_json::to_string(&context).unwrap();
@@ -939,17 +947,17 @@ mod tests {
     fn test_ax_error_code_all_values() {
         // Verify all error code constants are negative (except SUCCESS)
         assert_eq!(K_AX_ERROR_SUCCESS, 0);
-        assert!(K_AX_ERROR_FAILURE < 0);
-        assert!(K_AX_ERROR_ILLEGAL_ARGUMENT < 0);
-        assert!(K_AX_ERROR_INVALID_UI_ELEMENT < 0);
-        assert!(K_AX_ERROR_INVALID_UI_ELEMENT_OBSERVER < 0);
-        assert!(K_AX_ERROR_CANNOT_COMPLETE < 0);
-        assert!(K_AX_ERROR_NOT_IMPLEMENTED < 0);
-        assert!(K_AX_ERROR_NOT_UI_ELEMENT < 0);
-        assert!(K_AX_ERROR_NO_VALUE < 0);
+        assert_eq!(K_AX_ERROR_FAILURE, -25200);
+        assert_eq!(K_AX_ERROR_ILLEGAL_ARGUMENT, -25201);
+        assert_eq!(K_AX_ERROR_INVALID_UI_ELEMENT, -25202);
+        assert_eq!(K_AX_ERROR_INVALID_UI_ELEMENT_OBSERVER, -25203);
+        assert_eq!(K_AX_ERROR_CANNOT_COMPLETE, -25204);
+        assert_eq!(K_AX_ERROR_NOT_IMPLEMENTED, -25205);
+        assert_eq!(K_AX_ERROR_NOT_UI_ELEMENT, -25206);
+        assert_eq!(K_AX_ERROR_NO_VALUE, -25212);
 
         // Verify they are all distinct
-        let error_codes = vec![
+        let error_codes: &[AXError] = &[
             K_AX_ERROR_SUCCESS,
             K_AX_ERROR_FAILURE,
             K_AX_ERROR_ILLEGAL_ARGUMENT,
@@ -977,10 +985,12 @@ mod tests {
 
     #[test]
     fn test_semantic_context_clone() {
-        let mut context = SemanticContext::default();
-        context.ax_role = Some("AXButton".to_string());
-        context.title = Some("Test".to_string());
-        context.ancestors.push(("AXWindow".to_string(), None));
+        let context = SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Test".to_string()),
+            ancestors: vec![("AXWindow".to_string(), None)],
+            ..Default::default()
+        };
 
         let cloned = context.clone();
         assert_eq!(cloned.ax_role, context.ax_role);

@@ -721,9 +721,11 @@ mod tests {
             1,
         );
 
-        let mut semantic = SemanticContext::default();
-        semantic.ax_role = Some("AXButton".to_string());
-        semantic.title = Some("Click Me".to_string());
+        let semantic = SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Click Me".to_string()),
+            ..Default::default()
+        };
 
         let enriched = EnrichedEvent::new(raw, 42).with_semantic(semantic.clone());
         assert!(enriched.semantic.is_some());
@@ -770,9 +772,11 @@ mod tests {
 
     #[test]
     fn test_modifier_flags_serialization() {
-        let mut flags = ModifierFlags::default();
-        flags.shift = true;
-        flags.command = true;
+        let flags = ModifierFlags {
+            shift: true,
+            command: true,
+            ..Default::default()
+        };
 
         let serialized = serde_json::to_string(&flags).unwrap();
         let deserialized: ModifierFlags = serde_json::from_str(&serialized).unwrap();

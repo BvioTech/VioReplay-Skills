@@ -850,7 +850,7 @@ mod tests {
         let boundaries = detector.detect_boundaries(&events);
 
         // Should detect multiple boundaries
-        assert!(boundaries.len() >= 1);
+        assert!(!boundaries.is_empty());
         for boundary in &boundaries {
             assert_eq!(boundary.operator_type, OperatorType::Mental);
             assert!(boundary.confidence > 0.0);

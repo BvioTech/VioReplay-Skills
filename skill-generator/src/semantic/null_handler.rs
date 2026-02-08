@@ -580,8 +580,7 @@ mod tests {
 
         // First 8 offsets should all be at the first radius (spiral_step)
         let first_radius = handler.spiral_step;
-        for i in 0..8 {
-            let (dx, dy) = offsets[i];
+        for (i, &(dx, dy)) in offsets[..8].iter().enumerate() {
             let radius = (dx * dx + dy * dy).sqrt();
             assert!((radius - first_radius).abs() < 0.1,
                 "Offset {} has radius {} but expected ~{}", i, radius, first_radius);
@@ -589,11 +588,10 @@ mod tests {
 
         // Next 8 offsets should be at second radius (2 * spiral_step)
         let second_radius = handler.spiral_step * 2.0;
-        for i in 8..16 {
-            let (dx, dy) = offsets[i];
+        for (i, &(dx, dy)) in offsets[8..16].iter().enumerate() {
             let radius = (dx * dx + dy * dy).sqrt();
             assert!((radius - second_radius).abs() < 0.1,
-                "Offset {} has radius {} but expected ~{}", i, radius, second_radius);
+                "Offset {} has radius {} but expected ~{}", i + 8, radius, second_radius);
         }
     }
 

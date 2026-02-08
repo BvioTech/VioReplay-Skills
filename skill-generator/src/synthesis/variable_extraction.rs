@@ -789,7 +789,7 @@ mod tests {
 
         // Create keyboard events
         let mut events = Vec::new();
-        let chars = vec!['h', 'e', 'l', 'l', 'o'];
+        let chars = ['h', 'e', 'l', 'l', 'o'];
 
         for (i, ch) in chars.iter().enumerate() {
             events.push(EnrichedEvent {

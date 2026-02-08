@@ -266,19 +266,19 @@ mod tests {
         let mut recording = Recording::new("test".to_string(), None);
 
         let raw = make_test_raw_event(EventType::LeftMouseDown, 100.0, 200.0);
-        let semantic = Some(SemanticContext {
+        let semantic = SemanticContext {
             ax_role: Some("AXButton".to_string()),
             title: Some("Click Me".to_string()),
             ..Default::default()
-        });
+        };
 
-        recording.add_enriched_raw(raw, semantic.clone());
+        recording.add_enriched_raw(raw, Some(semantic.clone()));
 
         assert_eq!(recording.len(), 1);
         assert!(recording.events[0].semantic.is_some());
         assert_eq!(
             recording.events[0].semantic.as_ref().unwrap().title,
-            semantic.unwrap().title
+            semantic.title
         );
     }
 

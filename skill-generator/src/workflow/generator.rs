@@ -9,6 +9,8 @@ use crate::analysis::kinematic_segmentation::{KinematicSegmenter, MovementPatter
 use crate::analysis::rdp_simplification::RdpSimplifier;
 use crate::capture::types::{EnrichedEvent, EventType};
 use crate::chunking::action_clustering::{ActionClusterer, ClusteringConfig, UnitTask};
+use crate::chunking::context_stack::ContextStack;
+use crate::chunking::goms_detector::{ChunkBoundary, GomsDetector};
 use crate::codegen::markdown_builder::MarkdownBuilder;
 use crate::codegen::skill_compiler::{AxMetadata, CompiledSkill, CompiledStep, ExecutionContext as CompiledContext, SkillInput, TechnicalContext};
 use crate::codegen::validation::{SkillValidator, ValidationResult};
@@ -47,6 +49,10 @@ pub struct GeneratorConfig {
     pub use_vision_ocr: bool,
     /// Use RDP + kinematic analysis for trajectory processing and confidence adjustment
     pub use_trajectory_analysis: bool,
+    /// Use GOMS mental operator detection for cognitive boundary analysis
+    pub use_goms_detection: bool,
+    /// Use ContextStack to track window/app context changes during generation
+    pub use_context_tracking: bool,
 }
 
 impl Default for GeneratorConfig {
@@ -63,6 +69,8 @@ impl Default for GeneratorConfig {
             use_local_recovery: true,
             use_vision_ocr: true,
             use_trajectory_analysis: true,
+            use_goms_detection: true,
+            use_context_tracking: true,
         }
     }
 }
@@ -114,6 +122,10 @@ pub struct SkillGenerator {
     rdp_simplifier: RdpSimplifier,
     /// Kinematic segmenter for movement analysis
     kinematic_segmenter: KinematicSegmenter,
+    /// GOMS detector for cognitive boundary analysis
+    goms_detector: GomsDetector,
+    /// Context stack for tracking window/app context changes
+    context_stack: std::sync::Mutex<ContextStack>,
 }
 
 impl SkillGenerator {
@@ -142,6 +154,8 @@ impl SkillGenerator {
             null_handler,
             rdp_simplifier: RdpSimplifier::new(),
             kinematic_segmenter: KinematicSegmenter::new(),
+            goms_detector: GomsDetector::new(),
+            context_stack: std::sync::Mutex::new(ContextStack::new()),
         }
     }
 
@@ -166,6 +180,22 @@ impl SkillGenerator {
 
         if significant_events.is_empty() {
             return Err(GeneratorError::NoSignificantEvents);
+        }
+
+        // Step 1.5: Detect GOMS cognitive boundaries (if enabled)
+        let goms_boundaries = if self.config.use_goms_detection {
+            let boundaries = self.goms_detector.detect_boundaries(&enriched_recording.events);
+            if !boundaries.is_empty() {
+                info!("GOMS detector found {} cognitive boundaries", boundaries.len());
+            }
+            boundaries
+        } else {
+            Vec::new()
+        };
+
+        // Step 1.6: Track window/app context transitions (if enabled)
+        if self.config.use_context_tracking {
+            self.track_context_transitions(&enriched_recording);
         }
 
         // Step 2: Bind intents to events
@@ -205,6 +235,13 @@ impl SkillGenerator {
         // Step 4.5: Analyze trajectories and adjust confidence (if enabled)
         let steps = if self.config.use_trajectory_analysis {
             self.adjust_confidence_from_trajectory(steps, &enriched_recording)
+        } else {
+            steps
+        };
+
+        // Step 4.6: Boost confidence for steps near GOMS cognitive boundaries
+        let steps = if self.config.use_goms_detection && !goms_boundaries.is_empty() {
+            self.apply_goms_confidence(steps, &goms_boundaries, &enriched_recording)
         } else {
             steps
         };
@@ -489,6 +526,104 @@ impl SkillGenerator {
         }
 
         steps
+    }
+
+    /// Apply GOMS cognitive boundary analysis to boost step confidence
+    ///
+    /// Steps that immediately follow a detected mental operator (cognitive pause)
+    /// are likely deliberate actions, so their confidence is boosted.
+    fn apply_goms_confidence(
+        &self,
+        mut steps: Vec<GeneratedStep>,
+        boundaries: &[ChunkBoundary],
+        recording: &Recording,
+    ) -> Vec<GeneratedStep> {
+        if boundaries.is_empty() || steps.is_empty() {
+            return steps;
+        }
+
+        // Build a set of event indices that are at GOMS boundaries
+        let boundary_indices: std::collections::HashSet<usize> =
+            boundaries.iter().map(|b| b.event_index).collect();
+
+        for step in &mut steps {
+            // Check if any of this step's source events are near a GOMS boundary
+            let near_boundary = step.source_events.iter().any(|&src_idx| {
+                // Check if this event index or adjacent indices are GOMS boundaries
+                boundary_indices.contains(&src_idx)
+                    || (src_idx > 0 && boundary_indices.contains(&(src_idx - 1)))
+                    || boundary_indices.contains(&(src_idx + 1))
+            });
+
+            if near_boundary {
+                // Steps following a cognitive pause are deliberate — boost confidence
+                let boost = 0.05;
+                step.confidence = (step.confidence + boost).min(1.0);
+                debug!(
+                    "Step {}: near GOMS boundary, confidence boosted by {:.2} to {:.2}",
+                    step.number, boost, step.confidence
+                );
+            }
+        }
+
+        let _ = recording; // Used for context in future enhancements
+        steps
+    }
+
+    /// Track window/app context transitions from a recording
+    ///
+    /// Populates the ContextStack with window focus changes detected
+    /// from semantic data in the recording events.
+    fn track_context_transitions(&self, recording: &Recording) {
+        use crate::chunking::context_stack::WindowContext;
+
+        let mut stack = match self.context_stack.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        stack.clear();
+
+        let mut last_bundle: Option<String> = None;
+
+        for event in &recording.events {
+            if let Some(ref semantic) = event.semantic {
+                let bundle = semantic.app_bundle_id.clone().unwrap_or_default();
+
+                // Detect app switches
+                if let Some(ref prev_bundle) = last_bundle {
+                    if !bundle.is_empty() && bundle != *prev_bundle {
+                        stack.on_app_switched(prev_bundle, &bundle, event.raw.timestamp.ticks());
+                        debug!(
+                            "Context transition: {} -> {} at tick {}",
+                            prev_bundle, bundle, event.raw.timestamp.ticks()
+                        );
+                    }
+                }
+
+                // Track window focus from semantic title changes
+                if let Some(ref title) = semantic.title {
+                    let window_id = bundle.len() as u32 ^ title.len() as u32;
+                    let ctx = WindowContext {
+                        window_id,
+                        title: title.clone(),
+                        app_bundle_id: bundle.clone(),
+                        app_name: bundle.split('.').next_back().unwrap_or("").to_string(),
+                        z_index: 0,
+                        activated_at: event.raw.timestamp.ticks(),
+                    };
+                    stack.on_window_focused(ctx, event.raw.timestamp.ticks());
+                }
+
+                if !bundle.is_empty() {
+                    last_bundle = Some(bundle);
+                }
+            }
+        }
+
+        let transitions = stack.depth();
+        if transitions > 0 {
+            info!("Context tracking: {} window contexts detected", transitions);
+        }
     }
 
     /// Extract significant events from recording
@@ -2281,5 +2416,154 @@ mod tests {
         assert_eq!(skill.steps.len(), 1);
         // Without trajectory analysis, default click confidence is 0.9
         assert_eq!(skill.steps[0].confidence, 0.9);
+    }
+
+    #[test]
+    fn test_goms_detection_enabled_by_default() {
+        let config = GeneratorConfig::default();
+        assert!(config.use_goms_detection);
+    }
+
+    #[test]
+    fn test_goms_detection_disabled_skips_analysis() {
+        MachTimebase::init();
+        let generator = SkillGenerator::with_config(GeneratorConfig {
+            use_action_clustering: false,
+            use_goms_detection: false,
+            ..Default::default()
+        });
+        let mut recording = Recording::new("no_goms_test".to_string(), None);
+
+        let mut click = make_test_event(EventType::LeftMouseDown, 100.0, 100.0);
+        click.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Button".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click);
+
+        let skill = generator.generate(&recording).unwrap();
+        assert_eq!(skill.steps.len(), 1);
+        // Without GOMS, confidence is unchanged from default
+        assert!(skill.steps[0].confidence > 0.0);
+    }
+
+    #[test]
+    fn test_context_tracking_enabled_by_default() {
+        let config = GeneratorConfig::default();
+        assert!(config.use_context_tracking);
+    }
+
+    #[test]
+    fn test_context_tracking_populates_stack() {
+        MachTimebase::init();
+        let generator = SkillGenerator::with_config(GeneratorConfig {
+            use_action_clustering: false,
+            use_context_tracking: true,
+            ..Default::default()
+        });
+        let mut recording = Recording::new("context_test".to_string(), None);
+
+        // Two clicks in different apps
+        let mut click1 = make_test_event(EventType::LeftMouseDown, 100.0, 100.0);
+        click1.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Save".to_string()),
+            app_bundle_id: Some("com.apple.TextEdit".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click1);
+
+        let mut click2 = make_test_event(EventType::LeftMouseDown, 200.0, 200.0);
+        click2.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Open".to_string()),
+            app_bundle_id: Some("com.apple.Finder".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click2);
+
+        let skill = generator.generate(&recording).unwrap();
+        assert!(!skill.steps.is_empty());
+
+        // Verify context stack was populated (at least 1 window tracked)
+        let stack = generator.context_stack.lock().unwrap();
+        assert!(stack.depth() > 0);
+    }
+
+    #[test]
+    fn test_context_tracking_disabled_skips() {
+        MachTimebase::init();
+        let generator = SkillGenerator::with_config(GeneratorConfig {
+            use_action_clustering: false,
+            use_context_tracking: false,
+            ..Default::default()
+        });
+        let mut recording = Recording::new("no_context_test".to_string(), None);
+
+        let mut click = make_test_event(EventType::LeftMouseDown, 100.0, 100.0);
+        click.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Button".to_string()),
+            app_bundle_id: Some("com.test.App".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click);
+
+        let skill = generator.generate(&recording).unwrap();
+        assert_eq!(skill.steps.len(), 1);
+
+        // Context stack should be empty when tracking is disabled
+        let stack = generator.context_stack.lock().unwrap();
+        assert_eq!(stack.depth(), 0);
+    }
+
+    #[test]
+    fn test_goms_boundaries_boost_confidence() {
+        use crate::chunking::goms_detector::{ChunkBoundary, HesitationIndex, OperatorType};
+
+        let generator = SkillGenerator::with_config(GeneratorConfig {
+            use_action_clustering: false,
+            ..Default::default()
+        });
+
+        // Create a step with source_events referencing index 5
+        let step = GeneratedStep {
+            number: 1,
+            description: "Click button".to_string(),
+            action: Action::Click {
+                element_name: "Button".to_string(),
+                element_role: "AXButton".to_string(),
+                confidence: 0.8,
+            },
+            selector: None,
+            fallback_selectors: vec![],
+            variables: vec![],
+            verification: None,
+            source_events: vec![5],
+            confidence: 0.8,
+        };
+
+        // Create a GOMS boundary at index 5
+        let boundaries = vec![ChunkBoundary {
+            event_index: 5,
+            timestamp_ticks: 5000,
+            operator_type: OperatorType::Mental,
+            hesitation_index: HesitationIndex {
+                inverse_velocity: 0.9,
+                direction_change: 0.1,
+                pause_duration: 1500.0,
+                total: 0.85,
+            },
+            confidence: 0.9,
+        }];
+
+        let recording = Recording::new("test".to_string(), None);
+        let result = generator.apply_goms_confidence(vec![step], &boundaries, &recording);
+
+        // Confidence should be boosted
+        assert_eq!(result.len(), 1);
+        assert!(result[0].confidence > 0.8);
+        assert!((result[0].confidence - 0.85).abs() < 0.01);
     }
 }

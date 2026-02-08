@@ -625,7 +625,7 @@ mod tests {
         let actions = vec![make_click_action("Button1"), make_click_action("Button2")];
 
         let tasks = clusterer.cluster(&events, &actions);
-        assert!(tasks.len() >= 1);
+        assert!(!tasks.is_empty());
     }
 
     #[test]

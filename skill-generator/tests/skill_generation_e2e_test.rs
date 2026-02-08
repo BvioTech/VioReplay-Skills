@@ -202,22 +202,31 @@ fn test_e2e_form_fill_workflow() {
 #[test]
 fn test_e2e_keyboard_shortcuts() {
     MachTimebase::init();
-    let generator = SkillGenerator::new();
+    let generator = SkillGenerator::with_config(GeneratorConfig {
+        use_action_clustering: false,
+        ..Default::default()
+    });
     let mut recording = Recording::new(
         "copy_paste_workflow".to_string(),
         Some("Copy and paste text".to_string()),
     );
 
-    // Cmd+A (Select All)
-    let select_all = make_shortcut_event('a', 0, true, false);
+    // Cmd+A (Select All) - no character, only key_code + modifier (like real macOS events)
+    let mut select_all = make_shortcut_event('a', 0, true, false);
+    select_all.raw.character = None;
+    select_all.raw.key_code = Some(0);
     recording.add_event(select_all);
 
     // Cmd+C (Copy)
-    let copy = make_shortcut_event('c', 8, true, false);
+    let mut copy = make_shortcut_event('c', 8, true, false);
+    copy.raw.character = None;
+    copy.raw.key_code = Some(8);
     recording.add_event(copy);
 
     // Cmd+V (Paste)
-    let paste = make_shortcut_event('v', 9, true, false);
+    let mut paste = make_shortcut_event('v', 9, true, false);
+    paste.raw.character = None;
+    paste.raw.key_code = Some(9);
     recording.add_event(paste);
 
     recording.finalize(2000);
@@ -234,7 +243,10 @@ fn test_e2e_keyboard_shortcuts() {
 #[test]
 fn test_e2e_scroll_navigation() {
     MachTimebase::init();
-    let generator = SkillGenerator::new();
+    let generator = SkillGenerator::with_config(GeneratorConfig {
+        use_action_clustering: false,
+        ..Default::default()
+    });
     let mut recording = Recording::new(
         "scroll_to_bottom".to_string(),
         Some("Scroll to the bottom of the page".to_string()),
@@ -249,7 +261,7 @@ fn test_e2e_scroll_navigation() {
     recording.finalize(3000);
 
     let skill = generator.generate(&recording).expect("Failed to generate skill");
-    assert_eq!(skill.steps.len(), 5); // 5 scroll events
+    assert_eq!(skill.steps.len(), 1); // 5 same-direction scrolls consolidated into 1 step
 
     let markdown = generator.render_to_markdown(&skill);
     assert!(markdown.contains("Scroll"));
@@ -462,7 +474,10 @@ fn test_e2e_verification_blocks() {
 #[test]
 fn test_e2e_mixed_workflow() {
     MachTimebase::init();
-    let generator = SkillGenerator::new();
+    let generator = SkillGenerator::with_config(GeneratorConfig {
+        use_action_clustering: false,
+        ..Default::default()
+    });
     let mut recording = Recording::new(
         "create_document".to_string(),
         Some("Create a new document and save it".to_string()),
@@ -482,8 +497,10 @@ fn test_e2e_mixed_workflow() {
         recording.add_event(key);
     }
 
-    // Cmd+S to save
-    let save_shortcut = make_shortcut_event('s', 1, true, false);
+    // Cmd+S to save - no character, only key_code + modifier (like real macOS events)
+    let mut save_shortcut = make_shortcut_event('s', 1, true, false);
+    save_shortcut.raw.character = None;
+    save_shortcut.raw.key_code = Some(1);
     recording.add_event(save_shortcut);
 
     // Type filename

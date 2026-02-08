@@ -477,10 +477,12 @@ mod tests {
                 1,
             );
 
-            let mut semantic = SemanticContext::default();
-            semantic.title = Some(format!("Button {}", i + 1));
-            semantic.ax_role = Some("AXButton".to_string());
-            semantic.source = SemanticSource::Accessibility;
+            let semantic = SemanticContext {
+                title: Some(format!("Button {}", i + 1)),
+                ax_role: Some("AXButton".to_string()),
+                source: SemanticSource::Accessibility,
+                ..Default::default()
+            };
 
             events.push(EnrichedEvent::new(raw, i).with_semantic(semantic));
         }
@@ -514,9 +516,11 @@ mod tests {
                 (100.0, 200.0),
             );
 
-            let mut semantic = SemanticContext::default();
-            semantic.value = Some(format!("Text {}", i + 1));
-            semantic.source = SemanticSource::Accessibility;
+            let semantic = SemanticContext {
+                value: Some(format!("Text {}", i + 1)),
+                source: SemanticSource::Accessibility,
+                ..Default::default()
+            };
 
             events.push(EnrichedEvent::new(raw, i).with_semantic(semantic));
         }
@@ -548,8 +552,10 @@ mod tests {
                 1,
             );
 
-            let mut semantic = SemanticContext::default();
-            semantic.title = Some(format!("Item {}", i + 1));
+            let semantic = SemanticContext {
+                title: Some(format!("Item {}", i + 1)),
+                ..Default::default()
+            };
 
             events.push(EnrichedEvent::new(raw, i).with_semantic(semantic));
         }

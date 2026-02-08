@@ -460,7 +460,7 @@ mod tests {
         let secs = d.as_secs_f64();
 
         // Should be approximately 1.5 seconds
-        assert!(secs >= 1.49 && secs <= 1.51, "expected ~1.5s, got {}", secs);
+        assert!((1.49..=1.51).contains(&secs), "expected ~1.5s, got {}", secs);
     }
 
     #[test]
