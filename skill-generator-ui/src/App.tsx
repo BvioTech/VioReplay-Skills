@@ -802,11 +802,13 @@ function App() {
                     placeholder="Recording name (auto-generated if empty)"
                     value={recordingName}
                     onChange={(e) => setRecordingName(e.target.value)}
+                    aria-label="Recording name"
                   />
                   <textarea
                     placeholder="Describe the task you want to demonstrate..."
                     value={goal}
                     onChange={(e) => setGoal(e.target.value)}
+                    aria-label="Task description"
                     rows={3}
                   />
                   <button
@@ -836,6 +838,7 @@ function App() {
                   <button
                     className="btn btn-small"
                     onClick={() => navigator.clipboard.writeText(previewContent).then(() => setSuccess("Copied to clipboard"))}
+                    aria-label="Copy generated skill to clipboard"
                   >
                     Copy
                   </button>
@@ -846,6 +849,7 @@ function App() {
                         const skillPath = Object.values(generatedSkills).find(p => p.includes(previewName!));
                         if (skillPath) handleDownloadSkill(skillPath, previewName!);
                       }}
+                      aria-label="Download generated skill"
                     >
                       Download
                     </button>
@@ -853,6 +857,7 @@ function App() {
                   <button
                     className="btn btn-small"
                     onClick={() => { setPreviewContent(null); setPreviewName(null); }}
+                    aria-label="Close preview"
                   >
                     Dismiss
                   </button>
@@ -1042,12 +1047,14 @@ function App() {
                   <button
                     className="btn btn-small"
                     onClick={() => navigator.clipboard.writeText(skillPreviewContent).then(() => setSuccess("Copied to clipboard"))}
+                    aria-label="Copy skill to clipboard"
                   >
                     Copy
                   </button>
                   <button
                     className="btn btn-small"
                     onClick={() => { setSkillPreviewContent(null); setSkillPreviewName(null); }}
+                    aria-label="Close skill preview"
                   >
                     Dismiss
                   </button>
@@ -1154,6 +1161,7 @@ function App() {
                 placeholder="sk-ant-..."
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
+                aria-label="Anthropic API key"
                 onKeyDown={(e) => { if (e.key === "Enter" && apiKey) handleSaveApiKey(); }}
               />
               <button className="btn btn-primary" onClick={handleSaveApiKey} disabled={!apiKey}>
@@ -1322,7 +1330,7 @@ function App() {
             </p>
             <div className="about-meta">
               <span>v0.1.0</span>
-              <span>619 tests passing</span>
+              <span>650 tests passing</span>
             </div>
           </section>
         </div>
