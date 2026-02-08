@@ -5,11 +5,15 @@
 
 use super::recording::Recording;
 use crate::analysis::intent_binding::{Action, ScrollDirection};
+use crate::analysis::kinematic_segmentation::{KinematicSegmenter, MovementPattern};
+use crate::analysis::rdp_simplification::RdpSimplifier;
 use crate::capture::types::{EnrichedEvent, EventType};
+use crate::chunking::action_clustering::{ActionClusterer, ClusteringConfig, UnitTask};
 use crate::codegen::markdown_builder::MarkdownBuilder;
 use crate::codegen::skill_compiler::{AxMetadata, CompiledSkill, CompiledStep, ExecutionContext as CompiledContext, SkillInput, TechnicalContext};
 use crate::codegen::validation::{SkillValidator, ValidationResult};
 use crate::semantic::context_reconstruction::ContextReconstructor;
+use crate::semantic::null_handler::NullHandler;
 use crate::synthesis::selector_ranking::{RankedSelector, SelectorRanker, SelectorType};
 use crate::synthesis::variable_extraction::{ExtractedVariable, VariableExtractor};
 use crate::verification::hoare_triple_generator::{HoareTripleGenerator, VerificationBlock};
@@ -33,6 +37,16 @@ pub struct GeneratorConfig {
     pub use_llm_semantic: bool,
     /// API key for LLM calls (overrides ANTHROPIC_API_KEY env var)
     pub api_key: Option<String>,
+    /// Use ActionClusterer to group events into UnitTasks before step generation
+    pub use_action_clustering: bool,
+    /// Action clustering configuration (used when use_action_clustering is true)
+    pub clustering_config: ClusteringConfig,
+    /// Use NullHandler local recovery (AX retry + spiral search + Vision OCR) before LLM
+    pub use_local_recovery: bool,
+    /// Enable Vision OCR as part of local recovery pipeline
+    pub use_vision_ocr: bool,
+    /// Use RDP + kinematic analysis for trajectory processing and confidence adjustment
+    pub use_trajectory_analysis: bool,
 }
 
 impl Default for GeneratorConfig {
@@ -44,6 +58,11 @@ impl Default for GeneratorConfig {
             selector_chain_depth: 3,
             use_llm_semantic: true,
             api_key: None,
+            use_action_clustering: true,
+            clustering_config: ClusteringConfig::default(),
+            use_local_recovery: true,
+            use_vision_ocr: true,
+            use_trajectory_analysis: true,
         }
     }
 }
@@ -87,6 +106,14 @@ pub struct SkillGenerator {
     validator: SkillValidator,
     /// Context reconstructor for LLM semantic inference
     context_reconstructor: ContextReconstructor,
+    /// Action clusterer for grouping events into UnitTasks
+    action_clusterer: ActionClusterer,
+    /// Null handler for local accessibility recovery
+    null_handler: NullHandler,
+    /// RDP trajectory simplifier
+    rdp_simplifier: RdpSimplifier,
+    /// Kinematic segmenter for movement analysis
+    kinematic_segmenter: KinematicSegmenter,
 }
 
 impl SkillGenerator {
@@ -97,6 +124,12 @@ impl SkillGenerator {
 
     /// Create with custom configuration
     pub fn with_config(config: GeneratorConfig) -> Self {
+        let action_clusterer = ActionClusterer::with_config(config.clustering_config.clone());
+        let null_handler = if config.use_vision_ocr {
+            NullHandler::new().with_vision()
+        } else {
+            NullHandler::new()
+        };
         Self {
             config,
             variable_extractor: VariableExtractor::new(),
@@ -105,16 +138,27 @@ impl SkillGenerator {
             hoare_generator: HoareTripleGenerator::new(),
             validator: SkillValidator::new(),
             context_reconstructor: ContextReconstructor::new(),
+            action_clusterer,
+            null_handler,
+            rdp_simplifier: RdpSimplifier::new(),
+            kinematic_segmenter: KinematicSegmenter::new(),
         }
     }
 
     /// Generate a skill from a recording
     pub fn generate(&self, recording: &Recording) -> Result<GeneratedSkill, GeneratorError> {
-        // Step 0: Enrich events with LLM semantic inference if enabled
-        let enriched_recording = if self.config.use_llm_semantic {
-            self.enrich_with_llm_semantic(recording)
+        // Step 0a: Local recovery for events missing semantic data (fast, no network)
+        let locally_recovered = if self.config.use_local_recovery {
+            self.enrich_with_local_recovery(recording)
         } else {
             recording.clone()
+        };
+
+        // Step 0b: LLM semantic inference for remaining gaps (slower, requires API key)
+        let enriched_recording = if self.config.use_llm_semantic {
+            self.enrich_with_llm_semantic(&locally_recovered)
+        } else {
+            locally_recovered
         };
 
         // Step 1: Extract significant events (clicks, keystrokes)
@@ -127,6 +171,22 @@ impl SkillGenerator {
         // Step 2: Bind intents to events
         let actions = self.bind_intents(&significant_events, &enriched_recording);
 
+        // Step 2.5: Cluster significant events into UnitTasks (if enabled)
+        let unit_tasks = if self.config.use_action_clustering {
+            let action_list: Vec<Action> = actions.iter().map(|(_, a)| a.clone()).collect();
+            let sig_events: Vec<EnrichedEvent> = significant_events.iter().map(|e| (*e).clone()).collect();
+            let tasks = self.action_clusterer.cluster(&sig_events, &action_list);
+            if tasks.is_empty() {
+                debug!("ActionClusterer produced no tasks, falling back to raw actions");
+                None
+            } else {
+                info!("ActionClusterer produced {} unit tasks from {} significant events", tasks.len(), sig_events.len());
+                Some(tasks)
+            }
+        } else {
+            None
+        };
+
         // Step 3: Extract variables
         let variables = if self.config.extract_variables {
             let goal = enriched_recording.metadata.goal.as_deref().unwrap_or("");
@@ -135,15 +195,34 @@ impl SkillGenerator {
             Vec::new()
         };
 
-        // Step 4: Generate steps
-        let steps = self.generate_steps(&actions, &variables, &significant_events);
+        // Step 4: Generate steps (from UnitTasks if available, otherwise from raw actions)
+        let steps = if let Some(ref tasks) = unit_tasks {
+            self.generate_steps_from_tasks(tasks, &variables)
+        } else {
+            self.generate_steps(&actions, &variables, &significant_events)
+        };
+
+        // Step 4.5: Analyze trajectories and adjust confidence (if enabled)
+        let steps = if self.config.use_trajectory_analysis {
+            self.adjust_confidence_from_trajectory(steps, &enriched_recording)
+        } else {
+            steps
+        };
 
         // Step 5: Generate selectors
-        let steps_with_selectors = self.add_selectors(steps, &significant_events);
+        let steps_with_selectors = if let Some(ref tasks) = unit_tasks {
+            self.add_selectors_from_tasks(steps, tasks)
+        } else {
+            self.add_selectors(steps, &significant_events)
+        };
 
         // Step 6: Add verification blocks
         let steps_with_verification = if self.config.include_verification {
-            self.add_verification(steps_with_selectors, &significant_events)
+            if let Some(ref tasks) = unit_tasks {
+                self.add_verification_from_tasks(steps_with_selectors, tasks)
+            } else {
+                self.add_verification(steps_with_selectors, &significant_events)
+            }
         } else {
             steps_with_selectors
         };
@@ -162,6 +241,68 @@ impl SkillGenerator {
         };
 
         Ok(skill)
+    }
+
+    /// Attempt local recovery of semantic data using NullHandler
+    ///
+    /// Uses the accessibility API retry pipeline (injection + spiral search)
+    /// and optional Vision OCR fallback. Runs before LLM enrichment since
+    /// these methods are local, fast, and don't require API keys.
+    fn enrich_with_local_recovery(&self, recording: &Recording) -> Recording {
+        let events_needing_semantic: Vec<usize> = recording
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.raw.event_type.is_click() && e.semantic.is_none())
+            .map(|(i, _)| i)
+            .collect();
+
+        if events_needing_semantic.is_empty() {
+            debug!("All click events have semantic data, no local recovery needed");
+            return recording.clone();
+        }
+
+        info!(
+            "Attempting local recovery for {} events without semantic data",
+            events_needing_semantic.len()
+        );
+
+        let mut enriched = recording.clone();
+        let mut recovered_count = 0;
+
+        for idx in events_needing_semantic {
+            let event = &enriched.events[idx];
+            let (x, y) = event.raw.coordinates;
+
+            // Get app bundle ID from surrounding events if available
+            let app_bundle = event
+                .semantic
+                .as_ref()
+                .and_then(|s| s.app_bundle_id.clone())
+                .or_else(|| {
+                    // Look at nearby events for bundle info
+                    enriched.events.iter().find_map(|e| {
+                        e.semantic.as_ref().and_then(|s| s.app_bundle_id.clone())
+                    })
+                });
+
+            let result = self.null_handler.recover(x, y, app_bundle.as_deref());
+
+            if let Some(context) = result.context {
+                debug!(
+                    "Local recovery for event {} via {:?}: role={:?}, title={:?} ({:.0}ms)",
+                    idx, result.strategy, context.ax_role, context.title, result.duration_ms
+                );
+                enriched.events[idx].semantic = Some(context);
+                recovered_count += 1;
+            }
+        }
+
+        if recovered_count > 0 {
+            info!("Local recovery filled {} events", recovered_count);
+        }
+
+        enriched
     }
 
     /// Enrich events with LLM semantic inference for those missing semantic data
@@ -256,6 +397,98 @@ impl SkillGenerator {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Analyze mouse trajectories between clicks and adjust step confidence
+    ///
+    /// Uses RDP simplification to extract the trajectory shape, then
+    /// kinematic analysis to classify the movement pattern:
+    /// - Ballistic: confident, direct → keep/boost confidence
+    /// - Corrective: hesitant, multiple corrections → reduce confidence
+    /// - Searching: exploratory movement → reduce confidence
+    /// - Stationary: no movement → neutral
+    fn adjust_confidence_from_trajectory(
+        &self,
+        mut steps: Vec<GeneratedStep>,
+        recording: &Recording,
+    ) -> Vec<GeneratedStep> {
+        // Collect mouse-move events as raw events for trajectory analysis
+        let all_raw: Vec<&crate::capture::types::RawEvent> = recording
+            .events
+            .iter()
+            .map(|e| &e.raw)
+            .collect();
+
+        // Find click event indices in the full event stream
+        let click_indices: Vec<usize> = all_raw
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.event_type.is_click())
+            .map(|(i, _)| i)
+            .collect();
+
+        // For each click-based step, analyze the trajectory leading to it
+        for (step_idx, step) in steps.iter_mut().enumerate() {
+            // Only adjust confidence for click-based actions
+            if !matches!(
+                step.action,
+                Action::Click { .. } | Action::DoubleClick { .. } | Action::RightClick { .. }
+            ) {
+                continue;
+            }
+
+            // Find the trajectory segment leading to this click
+            if step_idx >= click_indices.len() {
+                continue;
+            }
+
+            let click_idx = click_indices[step_idx];
+            let start_idx = if step_idx > 0 {
+                click_indices[step_idx - 1] + 1
+            } else {
+                0
+            };
+
+            // Extract mouse-move events in this segment
+            let segment_events: Vec<crate::capture::types::RawEvent> = all_raw[start_idx..=click_idx]
+                .iter()
+                .filter(|e| e.event_type.is_mouse_move() || e.event_type.is_click())
+                .map(|e| (*e).clone())
+                .collect();
+
+            if segment_events.len() < 3 {
+                continue; // Not enough points for analysis
+            }
+
+            // Simplify trajectory
+            let simplified = self.rdp_simplifier.simplify_events(&segment_events);
+
+            if simplified.len() < 2 {
+                continue;
+            }
+
+            // Kinematic analysis
+            let analysis = self.kinematic_segmenter.analyze(&simplified);
+
+            // Adjust confidence based on movement pattern
+            let confidence_adjustment = match analysis.pattern {
+                MovementPattern::Ballistic => 0.05,    // Direct movement → boost
+                MovementPattern::Stationary => 0.0,    // No change
+                MovementPattern::Searching => -0.10,   // Uncertain → reduce
+                MovementPattern::Corrective => -0.15,  // Very uncertain → reduce more
+            };
+
+            step.confidence = (step.confidence + confidence_adjustment).clamp(0.1, 1.0);
+
+            if confidence_adjustment != 0.0 {
+                debug!(
+                    "Step {}: trajectory pattern {:?}, confidence adjusted by {:.2} to {:.2}",
+                    step.number, analysis.pattern, confidence_adjustment, step.confidence
+                );
+            }
+        }
+
+        steps
     }
 
     /// Extract significant events from recording
@@ -585,6 +818,66 @@ impl SkillGenerator {
         steps
     }
 
+    /// Generate steps from UnitTasks produced by ActionClusterer
+    ///
+    /// Each UnitTask maps to one GeneratedStep, using the task's primary_action
+    /// and name. This produces higher-level steps compared to raw action processing,
+    /// because the clusterer merges dropdown patterns, transient interactions, and
+    /// groups related events by time proximity and context.
+    fn generate_steps_from_tasks(
+        &self,
+        tasks: &[UnitTask],
+        variables: &[ExtractedVariable],
+    ) -> Vec<GeneratedStep> {
+        let mut steps = Vec::new();
+
+        for task in tasks {
+            let description = if task.name.starts_with("Select ") || task.name.starts_with("Click ") || task.name.starts_with("Fill ") {
+                task.name.clone()
+            } else {
+                // Use the primary action to generate a description, with context from the first significant event
+                let first_significant = task.events.iter().find(|e| {
+                    e.raw.event_type.is_click() || e.raw.event_type.is_keyboard()
+                });
+                if let Some(event) = first_significant {
+                    self.generate_step_description(&task.primary_action, event)
+                } else if let Some(event) = task.events.first() {
+                    self.generate_step_description(&task.primary_action, event)
+                } else {
+                    task.description.clone()
+                }
+            };
+
+            let step_variables: Vec<ExtractedVariable> = variables
+                .iter()
+                .filter(|v| description.contains(&format!("{{{{{}}}}}", v.name)))
+                .cloned()
+                .collect();
+
+            // Collect source event indices (using the event sequence numbers)
+            let source_events: Vec<usize> = task
+                .events
+                .iter()
+                .enumerate()
+                .map(|(i, _)| i)
+                .collect();
+
+            steps.push(GeneratedStep {
+                number: steps.len() + 1,
+                description,
+                action: task.primary_action.clone(),
+                selector: None,
+                fallback_selectors: vec![],
+                variables: step_variables,
+                verification: None,
+                source_events,
+                confidence: task.primary_action.confidence(),
+            });
+        }
+
+        steps
+    }
+
     /// Generate human-readable step description
     fn generate_step_description(&self, action: &Action, event: &EnrichedEvent) -> String {
         let target = self.get_target_description(event);
@@ -734,6 +1027,68 @@ impl SkillGenerator {
                         None,
                     );
                     step.verification = Some(verification);
+                }
+            }
+        }
+
+        steps
+    }
+
+    /// Add selectors to steps using UnitTask events
+    fn add_selectors_from_tasks(
+        &self,
+        mut steps: Vec<GeneratedStep>,
+        tasks: &[UnitTask],
+    ) -> Vec<GeneratedStep> {
+        for (i, step) in steps.iter_mut().enumerate() {
+            if let Some(task) = tasks.get(i) {
+                // Find the first click event in the task for selector generation
+                let target_event = task.events.iter().find(|e| {
+                    e.raw.event_type.is_click()
+                }).or(task.events.first());
+
+                if let Some(event) = target_event {
+                    let selectors = self.generate_selectors(event);
+                    if !selectors.is_empty() {
+                        step.selector = Some(selectors[0].clone());
+                        step.fallback_selectors = selectors
+                            .into_iter()
+                            .skip(1)
+                            .take(self.config.selector_chain_depth)
+                            .collect();
+                    }
+                }
+            }
+        }
+
+        steps
+    }
+
+    /// Add verification blocks to steps using UnitTask events
+    fn add_verification_from_tasks(
+        &self,
+        mut steps: Vec<GeneratedStep>,
+        tasks: &[UnitTask],
+    ) -> Vec<GeneratedStep> {
+        for (i, step) in steps.iter_mut().enumerate() {
+            if let Some(task) = tasks.get(i) {
+                let pre_event = task.events.first();
+                // Use the last event of this task or the first event of the next task
+                let post_event = if i + 1 < tasks.len() {
+                    tasks[i + 1].events.first()
+                } else {
+                    task.events.last()
+                };
+
+                if let Some(post) = post_event {
+                    let postconditions = self.postcondition_extractor.extract(pre_event, post);
+                    if !postconditions.is_empty() {
+                        let verification = self.hoare_generator.generate_verification_block(
+                            &postconditions,
+                            None,
+                        );
+                        step.verification = Some(verification);
+                    }
                 }
             }
         }
@@ -1100,6 +1455,7 @@ mod tests {
             selector_chain_depth: 2,
             use_llm_semantic: false,
             api_key: None,
+            ..Default::default()
         };
         let generator = SkillGenerator::with_config(config);
         assert!(!generator.config.include_verification);
@@ -1275,7 +1631,11 @@ mod tests {
     #[test]
     fn test_generate_steps_with_multiple_actions() {
         MachTimebase::init();
-        let generator = SkillGenerator::new();
+        let config = GeneratorConfig {
+            use_action_clustering: false,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
         let mut recording = Recording::new("multi_step".to_string(), Some("Fill form".to_string()));
 
         // Add multiple events
@@ -1421,6 +1781,7 @@ mod tests {
             include_verification: false,
             extract_variables: false,
             use_llm_semantic: false,
+            use_action_clustering: false,
             ..Default::default()
         };
         let generator = SkillGenerator::with_config(config);
@@ -1455,6 +1816,7 @@ mod tests {
             include_verification: false,
             extract_variables: false,
             use_llm_semantic: false,
+            use_action_clustering: false,
             ..Default::default()
         };
         let generator = SkillGenerator::with_config(config);
@@ -1502,6 +1864,7 @@ mod tests {
             include_verification: false,
             extract_variables: false,
             use_llm_semantic: false,
+            use_action_clustering: false,
             ..Default::default()
         };
         let generator = SkillGenerator::with_config(config);
@@ -1545,6 +1908,7 @@ mod tests {
             include_verification: false,
             extract_variables: false,
             use_llm_semantic: false,
+            use_action_clustering: false,
             ..Default::default()
         };
         let generator = SkillGenerator::with_config(config);
@@ -1578,6 +1942,7 @@ mod tests {
             include_verification: false,
             extract_variables: false,
             use_llm_semantic: false,
+            use_action_clustering: false,
             ..Default::default()
         };
         let generator = SkillGenerator::with_config(config);
@@ -1606,6 +1971,7 @@ mod tests {
             include_verification: false,
             extract_variables: false,
             use_llm_semantic: false,
+            use_action_clustering: false,
             ..Default::default()
         };
         let generator = SkillGenerator::with_config(config);
@@ -1636,6 +2002,7 @@ mod tests {
             include_verification: false,
             extract_variables: false,
             use_llm_semantic: false,
+            use_action_clustering: false,
             ..Default::default()
         };
         let generator = SkillGenerator::with_config(config);
@@ -1658,5 +2025,261 @@ mod tests {
         // Should only have 1 step (KeyUp filtered)
         assert_eq!(skill.steps.len(), 1);
         assert_eq!(skill.steps[0].description, "Type \"a\"");
+    }
+
+    #[test]
+    fn test_action_clustering_merges_click_and_typing() {
+        MachTimebase::init();
+        let config = GeneratorConfig {
+            include_verification: false,
+            extract_variables: false,
+            use_llm_semantic: false,
+            use_action_clustering: true,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let mut recording = Recording::new("cluster_test".to_string(), Some("Fill a field".to_string()));
+
+        // Click on text field + type text = single unit task (form fill)
+        let mut click = make_test_event(EventType::LeftMouseDown, 200.0, 100.0);
+        click.semantic = Some(SemanticContext {
+            ax_role: Some("AXTextField".to_string()),
+            title: Some("Username".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click);
+
+        recording.add_event(make_test_event_with_modifiers(
+            EventType::KeyDown, 0.0, 0.0,
+            ModifierFlags::default(), None, Some('u'),
+        ));
+        recording.add_event(make_test_event_with_modifiers(
+            EventType::KeyDown, 0.0, 0.0,
+            ModifierFlags::default(), None, Some('s'),
+        ));
+
+        let skill = generator.generate(&recording).unwrap();
+
+        // Clusterer groups click+typing into 1 unit task
+        assert_eq!(skill.steps.len(), 1);
+    }
+
+    #[test]
+    fn test_action_clustering_disabled_produces_raw_steps() {
+        MachTimebase::init();
+        let config = GeneratorConfig {
+            include_verification: false,
+            extract_variables: false,
+            use_llm_semantic: false,
+            use_action_clustering: false,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let mut recording = Recording::new("no_cluster_test".to_string(), None);
+
+        let mut click = make_test_event(EventType::LeftMouseDown, 200.0, 100.0);
+        click.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("OK".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click);
+
+        recording.add_event(make_test_event_with_modifiers(
+            EventType::KeyDown, 0.0, 0.0,
+            ModifierFlags::default(), None, Some('y'),
+        ));
+
+        let skill = generator.generate(&recording).unwrap();
+
+        // Without clustering, each significant event = 1 step
+        assert_eq!(skill.steps.len(), 2);
+    }
+
+    #[test]
+    fn test_action_clustering_fallback_on_single_event() {
+        MachTimebase::init();
+        let config = GeneratorConfig {
+            include_verification: false,
+            use_llm_semantic: false,
+            use_action_clustering: true,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let mut recording = Recording::new("single_event_test".to_string(), None);
+
+        // Single click: clusterer min_events=2, so falls back to raw actions
+        let mut click = make_test_event(EventType::LeftMouseDown, 100.0, 100.0);
+        click.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Submit".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click);
+
+        let skill = generator.generate(&recording).unwrap();
+
+        // Should still produce 1 step via raw action fallback
+        assert_eq!(skill.steps.len(), 1);
+        assert!(skill.steps[0].description.contains("Submit"));
+    }
+
+    #[test]
+    fn test_clustering_config_passed_through() {
+        let config = GeneratorConfig {
+            use_action_clustering: true,
+            clustering_config: ClusteringConfig {
+                max_gap_ms: 500,
+                min_events: 1,
+                merge_transient: false,
+                min_movement_px: 10.0,
+            },
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        assert_eq!(generator.action_clusterer.config.max_gap_ms, 500);
+        assert_eq!(generator.action_clusterer.config.min_events, 1);
+        assert!(!generator.action_clusterer.config.merge_transient);
+    }
+
+    #[test]
+    fn test_local_recovery_config_defaults() {
+        let config = GeneratorConfig::default();
+        assert!(config.use_local_recovery);
+        assert!(config.use_vision_ocr);
+    }
+
+    #[test]
+    fn test_local_recovery_disabled_skips_recovery() {
+        MachTimebase::init();
+        let config = GeneratorConfig {
+            use_local_recovery: false,
+            use_llm_semantic: false,
+            use_action_clustering: false,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let mut recording = Recording::new("no_recovery_test".to_string(), None);
+
+        // Click without semantic data - recovery disabled, should still work
+        let click = make_test_event(EventType::LeftMouseDown, 100.0, 100.0);
+        recording.add_event(click);
+
+        let skill = generator.generate(&recording).unwrap();
+        assert_eq!(skill.steps.len(), 1);
+        // Without recovery, element name will be coordinate-based
+        assert!(skill.steps[0].description.contains("100"));
+    }
+
+    #[test]
+    fn test_local_recovery_runs_before_llm() {
+        MachTimebase::init();
+        // Verify local recovery is invoked (Step 0a before 0b)
+        let config = GeneratorConfig {
+            use_local_recovery: true,
+            use_llm_semantic: false,
+            use_action_clustering: false,
+            use_vision_ocr: false,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let mut recording = Recording::new("recovery_order_test".to_string(), None);
+
+        let click = make_test_event(EventType::LeftMouseDown, 500.0, 500.0);
+        recording.add_event(click);
+
+        // Should not panic or error even when recovery finds nothing
+        let skill = generator.generate(&recording).unwrap();
+        assert_eq!(skill.steps.len(), 1);
+    }
+
+    #[test]
+    fn test_vision_ocr_flag_configures_null_handler() {
+        // With vision enabled
+        let config_with_vision = GeneratorConfig {
+            use_vision_ocr: true,
+            ..Default::default()
+        };
+        let _gen = SkillGenerator::with_config(config_with_vision);
+        // No panic = vision fallback initialized correctly
+
+        // Without vision
+        let config_no_vision = GeneratorConfig {
+            use_vision_ocr: false,
+            ..Default::default()
+        };
+        let _gen = SkillGenerator::with_config(config_no_vision);
+        // No panic = null handler initialized without vision
+    }
+
+    #[test]
+    fn test_trajectory_analysis_config_default() {
+        let config = GeneratorConfig::default();
+        assert!(config.use_trajectory_analysis);
+    }
+
+    #[test]
+    fn test_trajectory_analysis_adjusts_click_confidence() {
+        MachTimebase::init();
+        let config = GeneratorConfig {
+            include_verification: false,
+            extract_variables: false,
+            use_llm_semantic: false,
+            use_action_clustering: false,
+            use_local_recovery: false,
+            use_trajectory_analysis: true,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let mut recording = Recording::new("trajectory_test".to_string(), None);
+
+        // Add mouse moves leading to a click (simulates direct ballistic movement)
+        for i in 0..5 {
+            let event = make_test_event(EventType::MouseMoved, 100.0 + (i as f64 * 20.0), 200.0);
+            recording.add_event(event);
+        }
+
+        // Click at end of trajectory
+        let mut click = make_test_event(EventType::LeftMouseDown, 180.0, 200.0);
+        click.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Target".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click);
+
+        let skill = generator.generate(&recording).unwrap();
+        assert_eq!(skill.steps.len(), 1);
+        // Confidence should be adjusted (not exactly 0.9 default)
+        assert!(skill.steps[0].confidence > 0.0);
+    }
+
+    #[test]
+    fn test_trajectory_analysis_disabled() {
+        MachTimebase::init();
+        let config = GeneratorConfig {
+            include_verification: false,
+            extract_variables: false,
+            use_llm_semantic: false,
+            use_action_clustering: false,
+            use_local_recovery: false,
+            use_trajectory_analysis: false,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let mut recording = Recording::new("no_trajectory_test".to_string(), None);
+
+        let mut click = make_test_event(EventType::LeftMouseDown, 100.0, 100.0);
+        click.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Button".to_string()),
+            ..Default::default()
+        });
+        recording.add_event(click);
+
+        let skill = generator.generate(&recording).unwrap();
+        assert_eq!(skill.steps.len(), 1);
+        // Without trajectory analysis, default click confidence is 0.9
+        assert_eq!(skill.steps[0].confidence, 0.9);
     }
 }

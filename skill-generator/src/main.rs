@@ -2,7 +2,7 @@
 //!
 //! Transforms user interaction telemetry into Claude Code SKILL.md artifacts.
 
-use skill_generator::app::cli::{Cli, Commands};
+use skill_generator::app::cli::{Cli, Commands, ConfigAction};
 use skill_generator::app::config::Config;
 use skill_generator::capture::event_tap::EventTap;
 use skill_generator::capture::ring_buffer::EventRingBuffer;
@@ -65,6 +65,12 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Init { force } => {
             run_init(force, &config)?;
+        }
+        Commands::Delete { name, force } => {
+            run_delete(&name, force)?;
+        }
+        Commands::Config { action } => {
+            run_config(action, &config)?;
         }
     }
 
@@ -374,4 +380,163 @@ fn run_init(force: bool, config: &Config) -> anyhow::Result<()> {
     println!("  Skills: {:?}", Cli::skills_dir());
 
     Ok(())
+}
+
+fn run_delete(name: &str, force: bool) -> anyhow::Result<()> {
+    let recordings_dir = Cli::recordings_dir();
+
+    // Try exact filename first, then add .json extension
+    let candidates = vec![
+        recordings_dir.join(name),
+        recordings_dir.join(format!("{}.json", name)),
+    ];
+
+    let target = candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| anyhow::anyhow!("Recording '{}' not found in {:?}", name, recordings_dir))?;
+
+    if !force {
+        // Show what will be deleted
+        let file_size = std::fs::metadata(&target)?.len();
+        println!("Will delete: {} ({} bytes)", target.display(), file_size);
+        println!("Use --force to skip this prompt, or re-run with -f");
+        return Ok(());
+    }
+
+    std::fs::remove_file(&target)?;
+    info!("Deleted recording: {}", target.display());
+    println!("Deleted: {}", target.display());
+
+    Ok(())
+}
+
+fn run_config(action: ConfigAction, config: &Config) -> anyhow::Result<()> {
+    match action {
+        ConfigAction::Show => {
+            let toml_str = config.to_toml()?;
+            println!("Configuration ({:?}):\n", Config::default_path());
+            println!("{}", toml_str);
+        }
+        ConfigAction::Get { key } => {
+            let toml_str = config.to_toml()?;
+            // Simple key lookup in TOML output
+            let value = find_toml_value(&toml_str, &key);
+            match value {
+                Some(v) => println!("{} = {}", key, v),
+                None => {
+                    anyhow::bail!("Configuration key '{}' not found", key);
+                }
+            }
+        }
+        ConfigAction::Set { key, value } => {
+            let config_path = Config::default_path();
+            if !config_path.exists() {
+                anyhow::bail!(
+                    "No config file found. Run 'skill-gen init' first."
+                );
+            }
+
+            // Load, modify, and save
+            let mut toml_content = std::fs::read_to_string(&config_path)?;
+            if set_toml_value(&mut toml_content, &key, &value) {
+                std::fs::write(&config_path, &toml_content)?;
+                println!("Set {} = {}", key, value);
+            } else {
+                anyhow::bail!("Failed to set '{}'. Key may not exist in config.", key);
+            }
+        }
+        ConfigAction::Reset { force } => {
+            let config_path = Config::default_path();
+
+            if config_path.exists() && !force {
+                println!("Config exists at {:?}", config_path);
+                println!("Use --force to reset to defaults");
+                return Ok(());
+            }
+
+            let default_config = Config::default();
+            default_config.save_default()?;
+            println!("Configuration reset to defaults at {:?}", config_path);
+        }
+    }
+
+    Ok(())
+}
+
+/// Simple TOML value lookup by dotted key
+fn find_toml_value<'a>(toml_str: &'a str, key: &str) -> Option<&'a str> {
+    let parts: Vec<&str> = key.split('.').collect();
+    let leaf_key = parts.last()?;
+
+    // Find the right section
+    let mut in_section = parts.len() == 1; // Top-level key
+    let section_name = if parts.len() > 1 { parts[0] } else { "" };
+
+    for line in toml_str.lines() {
+        let trimmed = line.trim();
+
+        // Check for section header
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let section = &trimmed[1..trimmed.len() - 1];
+            in_section = section == section_name;
+            continue;
+        }
+
+        if in_section {
+            if let Some(eq_pos) = trimmed.find('=') {
+                let line_key = trimmed[..eq_pos].trim();
+                if line_key == *leaf_key {
+                    return Some(trimmed[eq_pos + 1..].trim());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Simple TOML value setter by dotted key
+fn set_toml_value(toml_str: &mut String, key: &str, value: &str) -> bool {
+    let parts: Vec<&str> = key.split('.').collect();
+    let leaf_key = parts.last().unwrap();
+
+    let section_name = if parts.len() > 1 { parts[0] } else { "" };
+    let mut in_section = parts.len() == 1;
+    let mut found = false;
+
+    let lines: Vec<String> = toml_str.lines().map(|l| l.to_string()).collect();
+    let mut new_lines = Vec::with_capacity(lines.len());
+
+    for line in &lines {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let section = &trimmed[1..trimmed.len() - 1];
+            in_section = section == section_name;
+        }
+
+        if in_section && !found {
+            if let Some(eq_pos) = trimmed.find('=') {
+                let line_key = trimmed[..eq_pos].trim();
+                if line_key == *leaf_key {
+                    new_lines.push(format!("{} = {}", leaf_key, value));
+                    found = true;
+                    continue;
+                }
+            }
+        }
+
+        new_lines.push(line.clone());
+    }
+
+    if found {
+        *toml_str = new_lines.join("\n");
+        // Ensure trailing newline
+        if !toml_str.ends_with('\n') {
+            toml_str.push('\n');
+        }
+    }
+
+    found
 }

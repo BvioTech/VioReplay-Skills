@@ -88,6 +88,51 @@ pub enum Commands {
         #[arg(short, long)]
         force: bool,
     },
+
+    /// Delete a recording
+    Delete {
+        /// Recording name or ID to delete
+        name: String,
+
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        force: bool,
+    },
+
+    /// View or modify configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+/// Config subcommands
+#[derive(Subcommand, Debug)]
+pub enum ConfigAction {
+    /// Show current configuration
+    Show,
+
+    /// Set a configuration value
+    Set {
+        /// Configuration key (e.g., "codegen.model", "recording.duration")
+        key: String,
+
+        /// Value to set
+        value: String,
+    },
+
+    /// Get a specific configuration value
+    Get {
+        /// Configuration key
+        key: String,
+    },
+
+    /// Reset configuration to defaults
+    Reset {
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 impl Cli {
@@ -395,6 +440,8 @@ mod tests {
         assert!(subcommands.contains(&"validate"));
         assert!(subcommands.contains(&"list"));
         assert!(subcommands.contains(&"init"));
+        assert!(subcommands.contains(&"delete"));
+        assert!(subcommands.contains(&"config"));
     }
 
     #[test]
@@ -409,6 +456,131 @@ mod tests {
         // Even if home_dir returns None, we should get a fallback
         let dir = Cli::skills_dir();
         assert!(!dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn test_cli_parse_delete_command() {
+        let args = vec![
+            "skill-gen",
+            "delete",
+            "my-recording",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        match cli.command {
+            Commands::Delete { name, force } => {
+                assert_eq!(name, "my-recording");
+                assert!(!force);
+            }
+            _ => panic!("Expected Delete command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_delete_command_force() {
+        let args = vec![
+            "skill-gen",
+            "delete",
+            "old-recording",
+            "--force",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        match cli.command {
+            Commands::Delete { name, force } => {
+                assert_eq!(name, "old-recording");
+                assert!(force);
+            }
+            _ => panic!("Expected Delete command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_config_show() {
+        let args = vec![
+            "skill-gen",
+            "config",
+            "show",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        match cli.command {
+            Commands::Config { action: ConfigAction::Show } => {}
+            _ => panic!("Expected Config Show"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_config_set() {
+        let args = vec![
+            "skill-gen",
+            "config",
+            "set",
+            "codegen.model",
+            "claude-sonnet-4-5-20250929",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        match cli.command {
+            Commands::Config { action: ConfigAction::Set { key, value } } => {
+                assert_eq!(key, "codegen.model");
+                assert_eq!(value, "claude-sonnet-4-5-20250929");
+            }
+            _ => panic!("Expected Config Set"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_config_get() {
+        let args = vec![
+            "skill-gen",
+            "config",
+            "get",
+            "codegen.temperature",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        match cli.command {
+            Commands::Config { action: ConfigAction::Get { key } } => {
+                assert_eq!(key, "codegen.temperature");
+            }
+            _ => panic!("Expected Config Get"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_config_reset() {
+        let args = vec![
+            "skill-gen",
+            "config",
+            "reset",
+            "--force",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        match cli.command {
+            Commands::Config { action: ConfigAction::Reset { force } } => {
+                assert!(force);
+            }
+            _ => panic!("Expected Config Reset"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_config_reset_defaults() {
+        let args = vec![
+            "skill-gen",
+            "config",
+            "reset",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        match cli.command {
+            Commands::Config { action: ConfigAction::Reset { force } } => {
+                assert!(!force);
+            }
+            _ => panic!("Expected Config Reset"),
+        }
     }
 
     #[test]
