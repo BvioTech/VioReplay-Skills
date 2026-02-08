@@ -13,21 +13,16 @@ rtrb = "0.3"
 # macOS system bindings
 core-graphics = "0.24"
 core-foundation = "0.10"
-cocoa = "0.26"
 objc = "0.2"
-objc-foundation = "0.1"
-block = "0.1"
 
 # Low-level mach bindings for precise timing
 mach2 = "0.4"
 
 # Concurrency primitives
-crossbeam = "0.8"
-crossbeam-channel = "0.5"
 parking_lot = "0.12"
 
-# Async runtime
-tokio = { version = "1", features = ["full"] }
+# Async runtime (rt-multi-thread for Runtime::new(), time for sleep, macros for #[tokio::test])
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -53,7 +48,6 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Configuration
 toml = "0.8"
-directories = "5"
 dirs = "5"
 
 # Regex for validation

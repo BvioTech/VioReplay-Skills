@@ -23,8 +23,8 @@ serde_json = "1"
 # Skill generator core library
 skill_generator = { path = "../../skill-generator" }
 
-# Async runtime
-tokio = { version = "1", features = ["full"] }
+# Async runtime (only rt-multi-thread needed for Runtime::new())
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 # Time handling
 chrono = "0.4"
