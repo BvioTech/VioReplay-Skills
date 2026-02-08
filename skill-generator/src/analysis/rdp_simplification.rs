@@ -69,9 +69,13 @@ impl RdpSimplifier {
         }
     }
 
-    /// Create a new simplifier with custom epsilon
+    /// Create a new simplifier with custom epsilon.
+    ///
+    /// Clamps epsilon to the range \[0.001, 10000.0\] to prevent degenerate behavior.
     pub fn with_epsilon(epsilon: f64) -> Self {
-        Self { epsilon }
+        Self {
+            epsilon: epsilon.clamp(0.001, 10_000.0),
+        }
     }
 
     /// Simplify a trajectory of mouse events
@@ -537,6 +541,39 @@ mod tests {
 
         let trajectory = SimplifiedTrajectory::from_events(&events, 1.0);
         assert!(trajectory.direction_vector().is_none());
+    }
+
+    #[test]
+    fn test_with_epsilon_clamps_negative() {
+        let simplifier = RdpSimplifier::with_epsilon(-5.0);
+        assert!((simplifier.epsilon - 0.001).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_with_epsilon_clamps_zero() {
+        let simplifier = RdpSimplifier::with_epsilon(0.0);
+        assert!((simplifier.epsilon - 0.001).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_with_epsilon_clamps_too_large() {
+        let simplifier = RdpSimplifier::with_epsilon(99_999.0);
+        assert!((simplifier.epsilon - 10_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_with_epsilon_valid_value_unchanged() {
+        let simplifier = RdpSimplifier::with_epsilon(5.0);
+        assert!((simplifier.epsilon - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_with_epsilon_boundary_values() {
+        let min = RdpSimplifier::with_epsilon(0.001);
+        assert!((min.epsilon - 0.001).abs() < 1e-6);
+
+        let max = RdpSimplifier::with_epsilon(10_000.0);
+        assert!((max.epsilon - 10_000.0).abs() < 1e-6);
     }
 
     #[test]
