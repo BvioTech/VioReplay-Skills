@@ -257,11 +257,17 @@ impl VisionFallback {
         }
 
         unsafe {
+            // Wrap in autorelease pool to drain autoreleased objects (e.g. arrayWithObject:)
+            // on background threads where there's no Cocoa run loop.
+            let pool_class = Class::get("NSAutoreleasePool").expect("NSAutoreleasePool");
+            let pool: *mut Object = msg_send![pool_class, new];
+
             // Step 1: Create VNImageRequestHandler from CGImage
             let handler_class = match Class::get("VNImageRequestHandler") {
                 Some(cls) => cls,
                 None => {
                     tracing::warn!("VNImageRequestHandler class not found - Vision framework unavailable");
+                    let _: () = msg_send![pool, drain];
                     return Vec::new();
                 }
             };
@@ -270,6 +276,7 @@ impl VisionFallback {
             let handler: *mut Object = msg_send![handler, initWithCGImage:image options:std::ptr::null::<Object>()];
             if handler.is_null() {
                 tracing::debug!("Failed to create VNImageRequestHandler");
+                let _: () = msg_send![pool, drain];
                 return Vec::new();
             }
 
@@ -279,6 +286,7 @@ impl VisionFallback {
                 None => {
                     let _: () = msg_send![handler, release];
                     tracing::warn!("VNRecognizeTextRequest class not found");
+                    let _: () = msg_send![pool, drain];
                     return Vec::new();
                 }
             };
@@ -287,6 +295,7 @@ impl VisionFallback {
             let request: *mut Object = msg_send![request, init];
             if request.is_null() {
                 let _: () = msg_send![handler, release];
+                let _: () = msg_send![pool, drain];
                 return Vec::new();
             }
 
@@ -302,6 +311,7 @@ impl VisionFallback {
                     let _: () = msg_send![request, release];
                     let _: () = msg_send![handler, release];
                     tracing::warn!("NSArray class not found");
+                    let _: () = msg_send![pool, drain];
                     return Vec::new();
                 }
             };
@@ -321,6 +331,7 @@ impl VisionFallback {
                 }
                 let _: () = msg_send![request, release];
                 let _: () = msg_send![handler, release];
+                let _: () = msg_send![pool, drain];
                 return Vec::new();
             }
 
@@ -329,6 +340,7 @@ impl VisionFallback {
             if results.is_null() {
                 let _: () = msg_send![request, release];
                 let _: () = msg_send![handler, release];
+                let _: () = msg_send![pool, drain];
                 return Vec::new();
             }
 
@@ -398,6 +410,7 @@ impl VisionFallback {
             // Cleanup
             let _: () = msg_send![request, release];
             let _: () = msg_send![handler, release];
+            let _: () = msg_send![pool, drain];
 
             text_regions
         }
@@ -442,15 +455,23 @@ impl VisionFallback {
         }
 
         unsafe {
+            // Wrap in autorelease pool to drain autoreleased objects on background threads
+            let pool_class = Class::get("NSAutoreleasePool").expect("NSAutoreleasePool");
+            let pool: *mut Object = msg_send![pool_class, new];
+
             // Create VNImageRequestHandler
             let handler_class = match Class::get("VNImageRequestHandler") {
                 Some(cls) => cls,
-                None => return Vec::new(),
+                None => {
+                    let _: () = msg_send![pool, drain];
+                    return Vec::new();
+                }
             };
 
             let handler: *mut Object = msg_send![handler_class, alloc];
             let handler: *mut Object = msg_send![handler, initWithCGImage:image options:std::ptr::null::<Object>()];
             if handler.is_null() {
+                let _: () = msg_send![pool, drain];
                 return Vec::new();
             }
 
@@ -460,6 +481,7 @@ impl VisionFallback {
                 None => {
                     let _: () = msg_send![handler, release];
                     tracing::debug!("VNDetectRectanglesRequest not available");
+                    let _: () = msg_send![pool, drain];
                     return Vec::new();
                 }
             };
@@ -468,6 +490,7 @@ impl VisionFallback {
             let request: *mut Object = msg_send![request, init];
             if request.is_null() {
                 let _: () = msg_send![handler, release];
+                let _: () = msg_send![pool, drain];
                 return Vec::new();
             }
 
@@ -482,6 +505,7 @@ impl VisionFallback {
                 None => {
                     let _: () = msg_send![request, release];
                     let _: () = msg_send![handler, release];
+                    let _: () = msg_send![pool, drain];
                     return Vec::new();
                 }
             };
@@ -493,6 +517,7 @@ impl VisionFallback {
             if success != YES {
                 let _: () = msg_send![request, release];
                 let _: () = msg_send![handler, release];
+                let _: () = msg_send![pool, drain];
                 return Vec::new();
             }
 
@@ -501,6 +526,7 @@ impl VisionFallback {
             if results.is_null() {
                 let _: () = msg_send![request, release];
                 let _: () = msg_send![handler, release];
+                let _: () = msg_send![pool, drain];
                 return Vec::new();
             }
 
@@ -541,6 +567,7 @@ impl VisionFallback {
 
             let _: () = msg_send![request, release];
             let _: () = msg_send![handler, release];
+            let _: () = msg_send![pool, drain];
 
             icons
         }

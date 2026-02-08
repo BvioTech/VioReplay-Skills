@@ -301,25 +301,56 @@ Respond in JSON format:
             confidence: Option<f32>,
         }
 
-        let api_response: ApiResponse = match response.json().await {
-            Ok(r) => r,
+        // Read the full response body as text first for diagnostics
+        let response_text = match response.text().await {
+            Ok(t) => t,
             Err(e) => {
-                tracing::warn!("Failed to parse LLM response: {}", e);
+                tracing::warn!("Failed to read LLM response body: {}", e);
                 return None;
             }
         };
 
-        let text = api_response.content.first()?.text.clone();
+        let api_response: ApiResponse = match serde_json::from_str(&response_text) {
+            Ok(r) => r,
+            Err(e) => {
+                let preview: String = response_text.chars().take(200).collect();
+                tracing::warn!(
+                    "Failed to parse LLM response as ApiResponse: {}. Response preview: {}",
+                    e, preview
+                );
+                return None;
+            }
+        };
+
+        let text = match api_response.content.first() {
+            Some(block) => block.text.clone(),
+            None => {
+                tracing::warn!("LLM response contained no content blocks");
+                return None;
+            }
+        };
 
         // Extract JSON from response
-        let json_start = text.find('{')?;
-        let json_end = text.rfind('}')?;
+        let json_start = match text.find('{') {
+            Some(i) => i,
+            None => {
+                tracing::warn!("LLM response contains no JSON object. Text: {}", &text[..text.len().min(200)]);
+                return None;
+            }
+        };
+        let json_end = match text.rfind('}') {
+            Some(i) => i,
+            None => {
+                tracing::warn!("LLM response contains no closing brace. Text: {}", &text[..text.len().min(200)]);
+                return None;
+            }
+        };
         let json_text = &text[json_start..=json_end];
 
         let inferred: InferredContext = match serde_json::from_str(json_text) {
             Ok(i) => i,
             Err(e) => {
-                tracing::warn!("Failed to parse inferred context: {}", e);
+                tracing::warn!("Failed to parse inferred context JSON: {}. Extracted: {}", e, json_text);
                 return None;
             }
         };
