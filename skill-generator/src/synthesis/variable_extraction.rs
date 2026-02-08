@@ -1010,6 +1010,73 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_variable_name_emoji() {
+        // Pure emoji: each emoji is_alphanumeric() but not ASCII, so they pass through
+        // sanitize doesn't strip them, but VALID_VAR_NAME (ASCII-only regex) won't match.
+        // This documents current behavior — emoji chars survive sanitization.
+        let result = sanitize_variable_name("🎉🎊🎈");
+        assert!(!result.is_empty());
+
+        // Mixed emoji and ASCII: emoji survives, ASCII part is intact
+        let result = sanitize_variable_name("😀button");
+        assert!(result.contains("button"));
+    }
+
+    #[test]
+    fn test_sanitize_variable_name_pure_underscores() {
+        // All underscores collapse to one, then trailing trim leaves empty
+        assert_eq!(sanitize_variable_name("___"), "unnamed_variable");
+        assert_eq!(sanitize_variable_name("_"), "unnamed_variable");
+    }
+
+    #[test]
+    fn test_sanitize_variable_name_very_long() {
+        let long_name = "a".repeat(10_000);
+        let result = sanitize_variable_name(&long_name);
+        assert!(VALID_VAR_NAME.is_match(&result));
+        assert_eq!(result.len(), 10_000);
+    }
+
+    #[test]
+    fn test_sanitize_variable_name_only_digits() {
+        // Starts with digit → prefixed, all valid chars kept
+        let result = sanitize_variable_name("12345");
+        assert!(VALID_VAR_NAME.is_match(&result));
+        assert!(result.starts_with("var_"));
+    }
+
+    #[test]
+    fn test_extracted_variable_serde_roundtrip() {
+        let var = ExtractedVariable {
+            name: "email_address".to_string(),
+            detected_value: "user@example.com".to_string(),
+            source: VariableSource::GoalMatch,
+            confidence: 0.92,
+            type_hint: Some("email".to_string()),
+            description: Some("User email from goal".to_string()),
+        };
+
+        let json = serde_json::to_string(&var).unwrap();
+        let roundtripped: ExtractedVariable = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(roundtripped.name, var.name);
+        assert_eq!(roundtripped.detected_value, var.detected_value);
+        assert_eq!(roundtripped.source, var.source);
+        assert!((roundtripped.confidence - var.confidence).abs() < 0.001);
+        assert_eq!(roundtripped.type_hint, var.type_hint);
+        assert_eq!(roundtripped.description, var.description);
+    }
+
+    #[test]
+    fn test_variable_source_serde_roundtrip() {
+        for source in [VariableSource::GoalMatch, VariableSource::TypedString, VariableSource::Implicit, VariableSource::LlmInferred] {
+            let json = serde_json::to_string(&source).unwrap();
+            let roundtripped: VariableSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(roundtripped, source);
+        }
+    }
+
+    #[test]
     fn test_semantic_match() {
         let extractor = VariableExtractor::new();
 

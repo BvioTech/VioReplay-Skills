@@ -720,4 +720,56 @@ mod tests {
             | RecoveryStrategy::None => {}
         }
     }
+
+    #[test]
+    fn test_recovery_native_app_skips_injection() {
+        // Native apps should skip injection and go directly to spiral search
+        let handler = NullHandler::new();
+        let result = handler.recover(100.0, 100.0, Some("com.apple.finder"));
+
+        // Injection is only for Electron apps, so Finder should not use it
+        assert_ne!(result.strategy, RecoveryStrategy::Injection);
+    }
+
+    #[test]
+    fn test_recovery_with_no_vision_fallback_skips_vision() {
+        // Without vision enabled, Vision strategy should never appear
+        let handler = NullHandler::new(); // No .with_vision()
+        assert!(handler.vision_fallback.is_none());
+
+        let result = handler.recover(100.0, 100.0, None);
+        assert_ne!(result.strategy, RecoveryStrategy::Vision);
+    }
+
+    #[test]
+    fn test_recovery_all_strategies_produce_valid_result() {
+        // No matter what happens internally, recover() always returns a valid RecoveryResult
+        let handler = NullHandler::new().with_vision();
+
+        // Various positions including edge cases
+        for (x, y) in [(0.0, 0.0), (99999.0, 99999.0), (-10.0, -10.0)] {
+            let result = handler.recover(x, y, None);
+            assert!(result.confidence >= 0.0);
+            assert!(result.confidence <= 1.0);
+        }
+    }
+
+    #[test]
+    fn test_recovery_strategy_copy() {
+        let strategy = RecoveryStrategy::Injection;
+        let copied = strategy;
+        assert_eq!(strategy, copied);
+    }
+
+    #[test]
+    fn test_spiral_zero_radius_produces_no_offsets() {
+        let handler = NullHandler {
+            max_spiral_radius: 0.0, // No search area
+            spiral_step: 5.0,
+            injection_timeout_ms: 100,
+            vision_fallback: None,
+        };
+        let offsets = handler.generate_spiral_offsets();
+        assert!(offsets.is_empty());
+    }
 }
