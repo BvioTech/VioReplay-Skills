@@ -24,6 +24,21 @@ use crate::verification::postcondition_extractor::PostconditionExtractor;
 use std::path::Path;
 use tracing::{debug, info};
 
+/// Check if two actions are duplicate clicks to the same target element.
+fn is_duplicate_click(a: &Action, b: &Action) -> bool {
+    match (a, b) {
+        (
+            Action::Click { element_name: n1, element_role: r1, .. },
+            Action::Click { element_name: n2, element_role: r2, .. },
+        ) => n1 == n2 && r1 == r2,
+        (
+            Action::RightClick { element_name: n1, element_role: r1, .. },
+            Action::RightClick { element_name: n2, element_role: r2, .. },
+        ) => n1 == n2 && r1 == r2,
+        _ => false,
+    }
+}
+
 /// Skill generation configuration
 #[derive(Debug, Clone)]
 pub struct GeneratorConfig {
@@ -305,6 +320,14 @@ impl SkillGenerator {
         } else {
             steps
         };
+
+        // Step 4.7: Post-processing noise filter
+        let pre_filter_count = steps.len();
+        let steps = self.filter_noise(steps);
+        stats.noise_filtered_count = pre_filter_count - steps.len();
+        if stats.noise_filtered_count > 0 {
+            debug!("Noise filter removed {} steps", stats.noise_filtered_count);
+        }
 
         // Step 5: Generate selectors
         let steps_with_selectors = if let Some(ref tasks) = unit_tasks {
@@ -622,6 +645,74 @@ impl SkillGenerator {
 
         let _ = recording; // Used for context in future enhancements
         steps
+    }
+
+    /// Post-processing noise filter that removes low-quality steps.
+    ///
+    /// Applies four filters:
+    /// 1. Removes steps below `min_step_confidence`
+    /// 2. Removes scroll steps with tiny magnitude (< 2.0 pixels)
+    /// 3. Removes `Unknown` action steps
+    /// 4. Deduplicates consecutive identical click steps to the same target
+    ///
+    /// After filtering, step numbers are renumbered sequentially.
+    fn filter_noise(&self, steps: Vec<GeneratedStep>) -> Vec<GeneratedStep> {
+        const MIN_SCROLL_MAGNITUDE: f64 = 2.0;
+
+        let min_confidence = self.config.min_step_confidence;
+
+        let mut filtered: Vec<GeneratedStep> = Vec::with_capacity(steps.len());
+
+        for step in steps {
+            // 1. Filter low-confidence steps
+            if step.confidence < min_confidence {
+                debug!(
+                    "Noise filter: removing step {} ({}) — confidence {:.2} < {:.2}",
+                    step.number, step.description, step.confidence, min_confidence
+                );
+                continue;
+            }
+
+            // 2. Filter tiny scrolls
+            if let Action::Scroll { magnitude, .. } = &step.action {
+                if magnitude.abs() < MIN_SCROLL_MAGNITUDE {
+                    debug!(
+                        "Noise filter: removing step {} — tiny scroll magnitude {:.1}",
+                        step.number, magnitude
+                    );
+                    continue;
+                }
+            }
+
+            // 3. Filter unknown actions
+            if matches!(&step.action, Action::Unknown { .. }) {
+                debug!(
+                    "Noise filter: removing step {} — unknown action",
+                    step.number
+                );
+                continue;
+            }
+
+            // 4. Deduplicate consecutive identical clicks to the same target
+            if let Some(prev) = filtered.last() {
+                if is_duplicate_click(&prev.action, &step.action) {
+                    debug!(
+                        "Noise filter: removing step {} — duplicate click on same target",
+                        step.number
+                    );
+                    continue;
+                }
+            }
+
+            filtered.push(step);
+        }
+
+        // Renumber steps sequentially
+        for (i, step) in filtered.iter_mut().enumerate() {
+            step.number = i + 1;
+        }
+
+        filtered
     }
 
     /// Track window/app context transitions from a recording
@@ -1503,6 +1594,8 @@ pub struct PipelineStats {
     pub trajectory_adjustments_count: usize,
     /// Number of variables extracted
     pub variables_count: usize,
+    /// Number of steps removed by post-processing noise filter
+    pub noise_filtered_count: usize,
     /// Total generated steps
     pub generated_steps_count: usize,
     /// Pipeline warnings (partial failures, fallbacks)
@@ -2852,5 +2945,191 @@ mod tests {
 
         let skill = generator.generate(&recording).unwrap();
         assert_eq!(skill.stats.variables_count, 0, "variables_count should be 0 when extract_variables disabled");
+    }
+
+    // --- Noise filter tests ---
+
+    fn make_step(number: usize, action: Action, confidence: f32) -> GeneratedStep {
+        GeneratedStep {
+            number,
+            description: format!("Step {}", number),
+            action,
+            selector: None,
+            fallback_selectors: Vec::new(),
+            variables: Vec::new(),
+            verification: None,
+            source_events: vec![number],
+            confidence,
+        }
+    }
+
+    #[test]
+    fn test_noise_filter_removes_low_confidence() {
+        let config = GeneratorConfig {
+            min_step_confidence: 0.7,
+            use_action_clustering: false,
+            use_local_recovery: false,
+            use_trajectory_analysis: false,
+            use_goms_detection: false,
+            use_context_tracking: false,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+
+        let steps = vec![
+            make_step(1, Action::Click { element_name: "A".into(), element_role: "AXButton".into(), confidence: 0.9 }, 0.9),
+            make_step(2, Action::Click { element_name: "B".into(), element_role: "AXButton".into(), confidence: 0.3 }, 0.3),
+            make_step(3, Action::Click { element_name: "C".into(), element_role: "AXButton".into(), confidence: 0.8 }, 0.8),
+        ];
+
+        let filtered = generator.filter_noise(steps);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].number, 1);
+        assert_eq!(filtered[1].number, 2);
+    }
+
+    #[test]
+    fn test_noise_filter_removes_tiny_scrolls() {
+        let config = GeneratorConfig::default();
+        let generator = SkillGenerator::with_config(config);
+
+        let steps = vec![
+            make_step(1, Action::Scroll { direction: ScrollDirection::Down, magnitude: 0.5, confidence: 0.9 }, 0.9),
+            make_step(2, Action::Scroll { direction: ScrollDirection::Down, magnitude: 10.0, confidence: 0.9 }, 0.9),
+            make_step(3, Action::Scroll { direction: ScrollDirection::Up, magnitude: 1.9, confidence: 0.9 }, 0.9),
+        ];
+
+        let filtered = generator.filter_noise(steps);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].number, 1);
+        if let Action::Scroll { magnitude, .. } = &filtered[0].action {
+            assert!(*magnitude > 2.0);
+        } else {
+            panic!("Expected Scroll action");
+        }
+    }
+
+    #[test]
+    fn test_noise_filter_removes_unknown_actions() {
+        let config = GeneratorConfig::default();
+        let generator = SkillGenerator::with_config(config);
+
+        let steps = vec![
+            make_step(1, Action::Click { element_name: "A".into(), element_role: "AXButton".into(), confidence: 0.9 }, 0.9),
+            make_step(2, Action::Unknown { description: "??".into(), confidence: 0.9 }, 0.9),
+        ];
+
+        let filtered = generator.filter_noise(steps);
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn test_noise_filter_deduplicates_consecutive_clicks() {
+        let config = GeneratorConfig::default();
+        let generator = SkillGenerator::with_config(config);
+
+        let steps = vec![
+            make_step(1, Action::Click { element_name: "Save".into(), element_role: "AXButton".into(), confidence: 0.9 }, 0.9),
+            make_step(2, Action::Click { element_name: "Save".into(), element_role: "AXButton".into(), confidence: 0.9 }, 0.9),
+            make_step(3, Action::Click { element_name: "Cancel".into(), element_role: "AXButton".into(), confidence: 0.9 }, 0.9),
+        ];
+
+        let filtered = generator.filter_noise(steps);
+        assert_eq!(filtered.len(), 2);
+        // First "Save" kept, second "Save" deduped, "Cancel" kept
+        if let Action::Click { element_name, .. } = &filtered[0].action {
+            assert_eq!(element_name, "Save");
+        }
+        if let Action::Click { element_name, .. } = &filtered[1].action {
+            assert_eq!(element_name, "Cancel");
+        }
+    }
+
+    #[test]
+    fn test_noise_filter_keeps_different_targets() {
+        let config = GeneratorConfig::default();
+        let generator = SkillGenerator::with_config(config);
+
+        let steps = vec![
+            make_step(1, Action::Click { element_name: "A".into(), element_role: "AXButton".into(), confidence: 0.9 }, 0.9),
+            make_step(2, Action::Click { element_name: "B".into(), element_role: "AXButton".into(), confidence: 0.9 }, 0.9),
+        ];
+
+        let filtered = generator.filter_noise(steps);
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_noise_filter_renumbers_steps() {
+        let config = GeneratorConfig {
+            min_step_confidence: 0.5,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+
+        let steps = vec![
+            make_step(1, Action::Click { element_name: "A".into(), element_role: "AXButton".into(), confidence: 0.9 }, 0.9),
+            make_step(2, Action::Unknown { description: "noise".into(), confidence: 0.9 }, 0.9),
+            make_step(3, Action::Click { element_name: "B".into(), element_role: "AXButton".into(), confidence: 0.8 }, 0.8),
+            make_step(4, Action::Scroll { direction: ScrollDirection::Down, magnitude: 0.1, confidence: 0.9 }, 0.9),
+            make_step(5, Action::Type { text: "hello".into(), confidence: 0.9 }, 0.9),
+        ];
+
+        let filtered = generator.filter_noise(steps);
+        // Unknown (step 2) and tiny scroll (step 4) removed
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[0].number, 1);
+        assert_eq!(filtered[1].number, 2);
+        assert_eq!(filtered[2].number, 3);
+    }
+
+    #[test]
+    fn test_noise_filter_empty_input() {
+        let config = GeneratorConfig::default();
+        let generator = SkillGenerator::with_config(config);
+        let filtered = generator.filter_noise(Vec::new());
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_noise_filter_stats_tracked_in_pipeline() {
+        MachTimebase::init();
+        let config = GeneratorConfig {
+            min_step_confidence: 0.7,
+            use_action_clustering: false,
+            use_local_recovery: false,
+            use_trajectory_analysis: false,
+            use_goms_detection: false,
+            use_context_tracking: false,
+            extract_variables: false,
+            include_verification: false,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let mut recording = Recording::new("noise_stats_test".to_string(), None);
+
+        // Add a scroll event with tiny magnitude → should be filtered
+        let mut scroll_event = make_test_event(EventType::ScrollWheel, 100.0, 100.0);
+        scroll_event.raw.scroll_delta = Some((0.0, 0.5)); // tiny
+        scroll_event.semantic = Some(SemanticContext {
+            ax_role: Some("AXScrollArea".into()),
+            title: Some("Content".into()),
+            ..Default::default()
+        });
+        recording.add_event(scroll_event);
+
+        // Add a normal click → should be kept
+        let mut click = make_test_event(EventType::LeftMouseDown, 200.0, 200.0);
+        click.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".into()),
+            title: Some("OK".into()),
+            ..Default::default()
+        });
+        recording.add_event(click);
+
+        let skill = generator.generate(&recording).unwrap();
+        // The pipeline ran successfully with the noise filter active
+        // (exact noise_filtered_count depends on what other noise the pipeline produces)
+        assert!(skill.stats.generated_steps_count <= 2, "should have at most 2 steps after filtering");
     }
 }

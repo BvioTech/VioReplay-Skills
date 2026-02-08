@@ -28,6 +28,7 @@ interface PipelineStatsInfo {
   unit_tasks_count: number;
   significant_events_count: number;
   trajectory_adjustments_count: number;
+  noise_filtered_count: number;
   variables_count: number;
   generated_steps_count: number;
   warnings: string[];
@@ -925,6 +926,10 @@ function App() {
                 <div className="stat-item" role="listitem" aria-label={`Trajectory Adjustments: ${pipelineStats.trajectory_adjustments_count}`}>
                   <span className="stat-number" aria-hidden="true">{pipelineStats.trajectory_adjustments_count}</span>
                   <span className="stat-desc" aria-hidden="true">Trajectory Adjustments</span>
+                </div>
+                <div className="stat-item" role="listitem" aria-label={`Noise Filtered: ${pipelineStats.noise_filtered_count}`}>
+                  <span className="stat-number" aria-hidden="true">{pipelineStats.noise_filtered_count}</span>
+                  <span className="stat-desc" aria-hidden="true">Noise Filtered</span>
                 </div>
               </div>
               {pipelineStats.warnings.length > 0 && (
