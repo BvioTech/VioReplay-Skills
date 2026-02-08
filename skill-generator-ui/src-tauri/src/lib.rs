@@ -226,8 +226,12 @@ fn get_recording_status(state: State<AppState>) -> Result<RecordingStatus, Strin
         });
     }
 
-    // Drain events from buffer
+    // Read checkpoint threshold before acquiring consumer/recording locks
+    let last_cp_val = *state.last_checkpoint_count.lock().map_err(|e| e.to_string())?;
+
+    // Drain events from buffer (consumer + recording locks only)
     let mut event_count = 0;
+    let mut did_checkpoint = false;
     {
         let mut consumer = state.consumer.lock().map_err(|e| e.to_string())?;
         let mut recording = state.recording.lock().map_err(|e| e.to_string())?;
@@ -239,18 +243,23 @@ fn get_recording_status(state: State<AppState>) -> Result<RecordingStatus, Strin
             }
             event_count = rec.len();
 
-            // Auto-save checkpoint every CHECKPOINT_INTERVAL events
-            let mut last_cp = state.last_checkpoint_count.lock().map_err(|e| e.to_string())?;
-            if event_count >= *last_cp + skill_generator::workflow::recording::CHECKPOINT_INTERVAL {
+            // Auto-save checkpoint if needed
+            if event_count >= last_cp_val + skill_generator::workflow::recording::CHECKPOINT_INTERVAL {
                 let recordings_dir = dirs::home_dir()
                     .unwrap_or_default()
                     .join(".skill_generator")
                     .join("recordings");
                 let cp_path = recordings_dir.join(format!("{}.json", rec.metadata.name));
                 let _ = rec.save_checkpoint(&cp_path);
-                *last_cp = event_count;
+                did_checkpoint = true;
             }
         }
+    }
+
+    // Update checkpoint count after releasing consumer/recording locks
+    if did_checkpoint {
+        let mut last_cp = state.last_checkpoint_count.lock().map_err(|e| e.to_string())?;
+        *last_cp = event_count;
     }
 
     let duration = {
