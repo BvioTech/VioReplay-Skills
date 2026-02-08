@@ -248,10 +248,16 @@ Respond in JSON format:
         );
 
         // Call Anthropic API
-        let client = reqwest::Client::builder()
+        let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_default();
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to build HTTP client: {}", e);
+                return None;
+            }
+        };
         let response = match client
             .post("https://api.anthropic.com/v1/messages")
             .header("x-api-key", &api_key)

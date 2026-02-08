@@ -556,8 +556,10 @@ fn generate_skill(state: State<AppState>, recording_path: String) -> Result<Gene
     info!(event_count = recording.len(), "Recording loaded");
 
     // Create generator with API key from state
-    let mut gen_config = skill_generator::workflow::generator::GeneratorConfig::default();
-    gen_config.api_key = api_key_value.clone();
+    let gen_config = skill_generator::workflow::generator::GeneratorConfig {
+        api_key: api_key_value.clone(),
+        ..Default::default()
+    };
     let generator = SkillGenerator::with_config(gen_config);
 
     // Generate skill
@@ -728,6 +730,121 @@ fn read_skill_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("Failed to read {}: {}", path, e))
 }
 
+/// Info about a generated skill for the frontend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillListEntry {
+    pub name: String,
+    pub category: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub modified_at: String,
+}
+
+/// List all generated skills from ~/.claude/skills/
+#[tauri::command]
+fn list_generated_skills() -> Result<Vec<SkillListEntry>, String> {
+    let skills_dir = dirs::home_dir()
+        .ok_or("Could not find home directory")?
+        .join(".claude")
+        .join("skills");
+
+    if !skills_dir.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut skills = Vec::new();
+
+    // Walk category directories
+    for category_entry in std::fs::read_dir(&skills_dir).map_err(|e| e.to_string())? {
+        let category_entry = category_entry.map_err(|e| e.to_string())?;
+        let category_path = category_entry.path();
+
+        if !category_path.is_dir() {
+            continue;
+        }
+
+        let category = category_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Walk skill directories within category
+        for skill_entry in std::fs::read_dir(&category_path).map_err(|e| e.to_string())? {
+            let skill_entry = skill_entry.map_err(|e| e.to_string())?;
+            let skill_path = skill_entry.path();
+
+            if !skill_path.is_dir() {
+                continue;
+            }
+
+            let skill_file = skill_path.join("SKILL.md");
+            if !skill_file.exists() {
+                continue;
+            }
+
+            let name = skill_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            let metadata = std::fs::metadata(&skill_file).map_err(|e| e.to_string())?;
+            let modified = metadata
+                .modified()
+                .map(|t| {
+                    let datetime: chrono::DateTime<chrono::Utc> = t.into();
+                    datetime.to_rfc3339()
+                })
+                .unwrap_or_default();
+
+            skills.push(SkillListEntry {
+                name,
+                category: category.clone(),
+                path: skill_file.to_string_lossy().to_string(),
+                size_bytes: metadata.len(),
+                modified_at: modified,
+            });
+        }
+    }
+
+    // Sort by modification time (newest first)
+    skills.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+
+    Ok(skills)
+}
+
+/// Delete a generated skill
+#[tauri::command(rename_all = "camelCase")]
+fn delete_skill(skill_path: String) -> Result<(), String> {
+    let path = std::path::Path::new(&skill_path);
+
+    // Validate path is within ~/.claude/skills/
+    let skills_dir = dirs::home_dir()
+        .ok_or("Could not find home directory")?
+        .join(".claude")
+        .join("skills");
+
+    if !path.exists() {
+        return Err(format!("Skill not found: {}", skill_path));
+    }
+
+    let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+    let canonical_dir = std::fs::canonicalize(&skills_dir).map_err(|e| e.to_string())?;
+    if !canonical.starts_with(&canonical_dir) {
+        return Err("Access denied: path is outside the skills directory".to_string());
+    }
+
+    // Delete the skill directory (parent of SKILL.md)
+    if let Some(parent) = path.parent() {
+        if parent.starts_with(&skills_dir) && parent != skills_dir {
+            std::fs::remove_dir_all(parent).map_err(|e| e.to_string())?;
+        } else {
+            std::fs::remove_file(path).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize structured logging
@@ -770,6 +887,8 @@ pub fn run() {
             get_config,
             save_config,
             read_skill_file,
+            list_generated_skills,
+            delete_skill,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

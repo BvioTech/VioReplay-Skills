@@ -34,7 +34,15 @@ interface UiConfig {
   temperature: number;
 }
 
-type Tab = "record" | "recordings" | "settings";
+interface SkillListEntry {
+  name: string;
+  category: string;
+  path: string;
+  size_bytes: number;
+  modified_at: string;
+}
+
+type Tab = "record" | "recordings" | "skills" | "settings";
 
 function App() {
   // Recording state
@@ -69,6 +77,12 @@ function App() {
   // Track generated skills by recording path -> skill path
   const [generatedSkills, setGeneratedSkills] = useState<Record<string, string>>({});
 
+  // Skills library state
+  const [skills, setSkills] = useState<SkillListEntry[]>([]);
+  const [skillPreviewContent, setSkillPreviewContent] = useState<string | null>(null);
+  const [skillPreviewName, setSkillPreviewName] = useState<string | null>(null);
+  const [confirmDeleteSkill, setConfirmDeleteSkill] = useState<string | null>(null);
+
   // Config state
   const [config, setConfig] = useState<UiConfig | null>(null);
 
@@ -79,6 +93,7 @@ function App() {
   useEffect(() => {
     checkStatus();
     loadRecordings();
+    loadSkills();
     loadApiKey();
     loadConfig();
   }, []);
@@ -184,6 +199,15 @@ function App() {
     }
   }
 
+  async function loadSkills() {
+    try {
+      const list = await invoke<SkillListEntry[]>("list_generated_skills");
+      setSkills(list);
+    } catch (e) {
+      console.error("Failed to load skills:", e);
+    }
+  }
+
   const handleStartRecording = useCallback(async () => {
     setError(null);
     setSuccess(null);
@@ -229,6 +253,7 @@ function App() {
       });
       setSuccess(`SKILL.md generated: ${skill.name} (${skill.steps_count} steps, ${skill.variables_count} variables)`);
       setGeneratedSkills(prev => ({ ...prev, [recordingPath]: skill.path }));
+      loadSkills();
 
       // Load preview
       try {
@@ -318,6 +343,32 @@ function App() {
     }
   }
 
+  async function handleDeleteSkill(path: string, name: string) {
+    if (confirmDeleteSkill === path) {
+      setConfirmDeleteSkill(null);
+      try {
+        await invoke("delete_skill", { skillPath: path });
+        setSkills((prev) => prev.filter((s) => s.path !== path));
+        setSuccess(`Deleted skill: ${name}`);
+        if (skillPreviewName === name) {
+          setSkillPreviewContent(null);
+          setSkillPreviewName(null);
+        }
+      } catch (e: unknown) {
+        const errorMsg = e instanceof Error ? e.message : String(e);
+        setError(`Failed to delete: ${errorMsg}`);
+        await loadSkills();
+      }
+    } else {
+      setConfirmDeleteSkill(path);
+    }
+  }
+
+  function formatSkillSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+
   function formatDuration(seconds: number): string {
     const mins = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
@@ -372,6 +423,12 @@ function App() {
           onClick={() => setActiveTab("recordings")}
         >
           Recordings{recordings.length > 0 ? ` (${recordings.length})` : ""}
+        </button>
+        <button
+          className={`tab ${activeTab === "skills" ? "tab-active" : ""}`}
+          onClick={() => { setActiveTab("skills"); loadSkills(); }}
+        >
+          Skills{skills.length > 0 ? ` (${skills.length})` : ""}
         </button>
         <button
           className={`tab ${activeTab === "settings" ? "tab-active" : ""}`}
@@ -586,6 +643,113 @@ function App() {
                         onBlur={() => setConfirmDelete(null)}
                       >
                         {confirmDelete === rec.name ? "Confirm?" : "Delete"}
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </div>
+      )}
+
+      {/* Skills Tab */}
+      {activeTab === "skills" && (
+        <div className="tab-content">
+          {/* Skill Preview */}
+          {skillPreviewContent && (
+            <section className="panel preview-panel">
+              <div className="preview-header">
+                <h2 className="panel-title">Skill: {skillPreviewName}</h2>
+                <div className="preview-actions">
+                  <button
+                    className="btn btn-small"
+                    onClick={() => navigator.clipboard.writeText(skillPreviewContent).then(() => setSuccess("Copied to clipboard"))}
+                  >
+                    Copy
+                  </button>
+                  <button
+                    className="btn btn-small"
+                    onClick={() => { setSkillPreviewContent(null); setSkillPreviewName(null); }}
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+              <pre className="skill-preview">{skillPreviewContent}</pre>
+            </section>
+          )}
+
+          <section className="panel">
+            <h2 className="panel-title">
+              Generated Skills
+              <button className="btn btn-tiny" onClick={() => loadSkills()} title="Refresh">
+                Refresh
+              </button>
+            </h2>
+            {skills.length === 0 ? (
+              <div className="empty-state">
+                <p>No skills generated yet</p>
+                <p className="empty-hint">
+                  Generate skills from recordings to see them here
+                </p>
+              </div>
+            ) : (
+              <ul className="recordings-list">
+                {skills.map((skill) => (
+                  <li key={skill.path} className="recording-item">
+                    <div className="recording-info">
+                      <div className="recording-name-row">
+                        <strong>{skill.name}</strong>
+                        <span className="recording-date">{formatDate(skill.modified_at)}</span>
+                      </div>
+                      <div className="recording-meta">
+                        <span className="meta-tag">{skill.category}</span>
+                        <span className="meta-tag">{formatSkillSize(skill.size_bytes)}</span>
+                      </div>
+                    </div>
+                    <div className="recording-actions">
+                      <button
+                        className="btn btn-small"
+                        onClick={async () => {
+                          try {
+                            const content = await invoke<string>("read_skill_file", { path: skill.path });
+                            setSkillPreviewContent(content);
+                            setSkillPreviewName(skill.name);
+                          } catch {
+                            setError("Failed to load skill");
+                          }
+                        }}
+                      >
+                        Preview
+                      </button>
+                      <button
+                        className="btn btn-small"
+                        onClick={async () => {
+                          try {
+                            const content = await invoke<string>("read_skill_file", { path: skill.path });
+                            await navigator.clipboard.writeText(content);
+                            setSuccess("Copied to clipboard");
+                          } catch {
+                            setError("Failed to copy skill");
+                          }
+                        }}
+                      >
+                        Copy
+                      </button>
+                      <button
+                        className="btn btn-small"
+                        onClick={() => handleOpenInFinder(skill.path)}
+                        title="Reveal in Finder"
+                      >
+                        Finder
+                      </button>
+                      <button
+                        className={`btn btn-small btn-danger${confirmDeleteSkill === skill.path ? " confirming" : ""}`}
+                        onClick={() => handleDeleteSkill(skill.path, skill.name)}
+                        onBlur={() => setConfirmDeleteSkill(null)}
+                      >
+                        {confirmDeleteSkill === skill.path ? "Confirm?" : "Delete"}
                       </button>
                     </div>
                   </li>
