@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uuid::Uuid;
 
+/// Current recording format version
+pub const CURRENT_FORMAT_VERSION: &str = "1.0";
+
 /// Checkpoint interval: save every N events
 pub const CHECKPOINT_INTERVAL: usize = 100;
 
@@ -18,6 +21,7 @@ fn checkpoint_path(final_path: &Path) -> std::path::PathBuf {
 
 /// Recording metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RecordingMetadata {
     /// Unique recording ID
     pub id: Uuid,
@@ -51,7 +55,7 @@ impl RecordingMetadata {
             ended_at: None,
             event_count: 0,
             duration_ms: 0,
-            format_version: "1.0".to_string(),
+            format_version: CURRENT_FORMAT_VERSION.to_string(),
         }
     }
 
@@ -60,6 +64,22 @@ impl RecordingMetadata {
         self.ended_at = Some(Utc::now());
         self.event_count = event_count;
         self.duration_ms = duration_ms;
+    }
+}
+
+impl Default for RecordingMetadata {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: String::new(),
+            goal: None,
+            app_context: None,
+            started_at: Utc::now(),
+            ended_at: None,
+            event_count: 0,
+            duration_ms: 0,
+            format_version: CURRENT_FORMAT_VERSION.to_string(),
+        }
     }
 }
 
@@ -161,10 +181,22 @@ impl Recording {
         recovered
     }
 
-    /// Load recording from a file
+    /// Load recording from a file.
+    ///
+    /// Logs a warning if the recording was saved with an unknown format version,
+    /// but still attempts to deserialize it (forward-compatible via `#[serde(default)]`).
     pub fn load(path: &Path) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let recording: Recording = serde_json::from_str(&content)?;
+        if recording.metadata.format_version != CURRENT_FORMAT_VERSION {
+            eprintln!(
+                "Warning: recording '{}' has format version '{}' (expected '{}'). \
+                 Some fields may use default values.",
+                recording.metadata.name,
+                recording.metadata.format_version,
+                CURRENT_FORMAT_VERSION,
+            );
+        }
         Ok(recording)
     }
 
@@ -206,7 +238,7 @@ impl Default for Recording {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::types::{CursorState, EventType, ModifierFlags};
+    use crate::capture::types::{CursorState, EventType, ModifierFlags, SemanticSource};
     use crate::time::timebase::{MachTimebase, Timestamp};
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -588,5 +620,115 @@ mod tests {
     fn test_checkpoint_path_helper() {
         let path = Path::new("/tmp/my_recording.json");
         assert_eq!(checkpoint_path(path), Path::new("/tmp/my_recording.json.tmp"));
+    }
+
+    #[test]
+    fn test_recording_metadata_default() {
+        let meta = RecordingMetadata::default();
+        assert!(meta.name.is_empty());
+        assert!(meta.goal.is_none());
+        assert!(meta.app_context.is_none());
+        assert!(meta.ended_at.is_none());
+        assert_eq!(meta.event_count, 0);
+        assert_eq!(meta.duration_ms, 0);
+        assert_eq!(meta.format_version, CURRENT_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn test_backward_compat_metadata_missing_fields() {
+        // Simulate a v0.x recording that lacked format_version and app_context
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "old_recording",
+            "goal": null,
+            "started_at": "2025-01-01T00:00:00Z",
+            "ended_at": null,
+            "event_count": 0,
+            "duration_ms": 0
+        }"#;
+        let meta: RecordingMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.name, "old_recording");
+        // Missing fields should get defaults
+        assert!(meta.app_context.is_none());
+        assert_eq!(meta.format_version, CURRENT_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn test_backward_compat_enriched_event_missing_fields() {
+        // Simulate a recording event that's missing the `semantic` and `sequence` fields
+        let json = r#"{
+            "raw": {
+                "timestamp": 1000,
+                "event_type": "LeftMouseDown",
+                "coordinates": [100.0, 200.0],
+                "cursor_state": "Arrow",
+                "key_code": null,
+                "character": null,
+                "modifiers": {"shift": false, "control": false, "option": false, "command": false, "caps_lock": false, "function": false},
+                "scroll_delta": null,
+                "click_count": 1
+            },
+            "id": "00000000-0000-0000-0000-000000000042"
+        }"#;
+        let event: EnrichedEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.raw.event_type, EventType::LeftMouseDown);
+        assert!(event.semantic.is_none());
+        assert_eq!(event.sequence, 0); // default
+    }
+
+    #[test]
+    fn test_backward_compat_raw_event_missing_fields() {
+        // Simulate a raw event missing optional fields that were added later
+        let json = r#"{
+            "timestamp": 500,
+            "event_type": "KeyDown",
+            "coordinates": [0.0, 0.0],
+            "modifiers": {"shift": false, "control": false, "option": false, "command": false, "caps_lock": false, "function": false}
+        }"#;
+        let event: RawEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.event_type, EventType::KeyDown);
+        assert_eq!(event.cursor_state, CursorState::Arrow); // default
+        assert!(event.key_code.is_none());
+        assert!(event.scroll_delta.is_none());
+        assert_eq!(event.click_count, 0);
+    }
+
+    #[test]
+    fn test_backward_compat_semantic_context_missing_fields() {
+        // Simulate a semantic context from before ancestors/ocr_text were added
+        let json = r#"{
+            "ax_role": "AXButton",
+            "title": "OK"
+        }"#;
+        let ctx: SemanticContext = serde_json::from_str(json).unwrap();
+        assert_eq!(ctx.ax_role, Some("AXButton".to_string()));
+        assert_eq!(ctx.title, Some("OK".to_string()));
+        assert!(ctx.ocr_text.is_none());
+        assert!(ctx.ancestors.is_empty());
+        assert_eq!(ctx.confidence, 1.0);
+        assert_eq!(ctx.source, SemanticSource::Accessibility);
+    }
+
+    #[test]
+    fn test_version_mismatch_still_loads() {
+        MachTimebase::init();
+        let mut recording = Recording::new("versioned".to_string(), None);
+        recording.add_raw_event(make_test_raw_event(EventType::LeftMouseDown, 10.0, 20.0));
+        recording.metadata.format_version = "2.0".to_string();
+
+        let temp_file = NamedTempFile::new().unwrap();
+        recording.save(temp_file.path()).unwrap();
+
+        // Loading a future version should still succeed (forward-compat via serde defaults)
+        let loaded = Recording::load(temp_file.path()).unwrap();
+        assert_eq!(loaded.metadata.format_version, "2.0");
+        assert_eq!(loaded.len(), 1);
+    }
+
+    #[test]
+    fn test_current_format_version_constant() {
+        assert_eq!(CURRENT_FORMAT_VERSION, "1.0");
+        let meta = RecordingMetadata::new("test".to_string(), None);
+        assert_eq!(meta.format_version, CURRENT_FORMAT_VERSION);
     }
 }

@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Event types captured by the system
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[repr(u8)]
 pub enum EventType {
     /// Mouse moved (includes drag)
+    #[default]
     MouseMoved = 0,
     /// Left mouse button pressed
     LeftMouseDown = 1,
@@ -174,9 +175,10 @@ impl SemanticState {
 }
 
 /// Source of semantic data
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum SemanticSource {
     /// Data from Accessibility API
+    #[default]
     Accessibility,
     /// Data from Vision/OCR fallback
     Vision,
@@ -188,6 +190,7 @@ pub enum SemanticSource {
 
 /// Semantic context extracted from accessibility/vision
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SemanticContext {
     /// Accessibility role (AXButton, AXTextField, etc.)
     pub ax_role: Option<String>,
@@ -278,6 +281,7 @@ impl ModifierFlags {
 
 /// Raw event as captured from the event tap
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RawEvent {
     /// Monotonic timestamp (mach_absolute_time ticks)
     pub timestamp: Timestamp,
@@ -368,8 +372,25 @@ impl RawEvent {
     }
 }
 
+impl Default for RawEvent {
+    fn default() -> Self {
+        Self {
+            timestamp: Timestamp::from_ticks(0),
+            event_type: EventType::default(),
+            coordinates: (0.0, 0.0),
+            cursor_state: CursorState::default(),
+            key_code: None,
+            character: None,
+            modifiers: ModifierFlags::default(),
+            scroll_delta: None,
+            click_count: 0,
+        }
+    }
+}
+
 /// Event with associated semantic context
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EnrichedEvent {
     /// The raw event data
     pub raw: RawEvent,
@@ -379,6 +400,17 @@ pub struct EnrichedEvent {
     pub id: uuid::Uuid,
     /// Sequence number in recording
     pub sequence: u64,
+}
+
+impl Default for EnrichedEvent {
+    fn default() -> Self {
+        Self {
+            raw: RawEvent::default(),
+            semantic: None,
+            id: uuid::Uuid::nil(),
+            sequence: 0,
+        }
+    }
 }
 
 impl EnrichedEvent {
