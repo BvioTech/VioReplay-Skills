@@ -1624,7 +1624,7 @@ pub struct GeneratedSkill {
 }
 
 /// Error type for skill generation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GeneratorError {
     /// No significant events in recording
     NoSignificantEvents,

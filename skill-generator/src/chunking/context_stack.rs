@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 
 /// Window context information
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowContext {
     /// Window ID
     pub window_id: u32,
@@ -22,7 +22,7 @@ pub struct WindowContext {
 }
 
 /// Context transition event
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextTransition {
     /// New window focused
     WindowFocused(WindowContext),
