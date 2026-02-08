@@ -6,6 +6,7 @@
 pub mod null_handler;
 pub mod vision_fallback;
 pub mod context_reconstruction;
+pub mod http_retry;
 
 pub use null_handler::NullHandler;
 pub use vision_fallback::VisionFallback;

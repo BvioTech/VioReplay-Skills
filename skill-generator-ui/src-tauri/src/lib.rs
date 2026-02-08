@@ -379,6 +379,42 @@ struct InferredSkillMeta {
 }
 
 /// Infer skill name and description by analyzing recording events
+/// Extract the first JSON object from a text response.
+/// Finds the outermost `{...}` and returns the substring.
+fn extract_json_from_text(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end >= start {
+        Some(&text[start..=end])
+    } else {
+        None
+    }
+}
+
+/// Sanitize an AI-inferred skill name: keep only alphanumeric, hyphens, underscores.
+/// Returns None if the result is empty or exceeds MAX_SKILL_NAME_LEN.
+fn sanitize_skill_name(name: &str) -> Option<String> {
+    let sanitized: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if sanitized.is_empty() || sanitized.len() > MAX_SKILL_NAME_LEN {
+        None
+    } else {
+        Some(sanitized.to_lowercase())
+    }
+}
+
+/// Sanitize an AI-inferred category: keep only alphanumeric, hyphens, underscores, lowercase.
+fn sanitize_category(category: Option<String>) -> Option<String> {
+    category.map(|c| {
+        c.chars()
+            .filter(|ch| ch.is_alphanumeric() || *ch == '-' || *ch == '_')
+            .collect::<String>()
+            .to_lowercase()
+    }).filter(|s| !s.is_empty())
+}
+
 fn infer_skill_from_recording(recording: &Recording, steps_summary: &str, model: &str, api_key: Option<&str>) -> Option<InferredSkillMeta> {
     let api_key = match api_key {
         Some(key) if !key.is_empty() => {
@@ -453,56 +489,18 @@ Requirements for name:
             "messages": [{"role": "user", "content": prompt}]
         });
 
-        let mut response = None;
-        let max_retries = 3u32;
-        for attempt in 0..max_retries {
-            let result = client
-                .post("https://api.anthropic.com/v1/messages")
+        let response = match skill_generator::semantic::http_retry::send_with_retry(
+            &client,
+            |c| c.post("https://api.anthropic.com/v1/messages")
                 .header("x-api-key", &api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await;
-
-            match result {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        response = Some(resp);
-                        break;
-                    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        let delay = std::time::Duration::from_secs(2u64.pow(attempt + 1));
-                        warn!("Rate limited (429), retrying in {:?}", delay);
-                        tokio::time::sleep(delay).await;
-                    } else if status.is_server_error() {
-                        let delay = std::time::Duration::from_secs(2u64.pow(attempt));
-                        warn!("Server error ({}), retrying in {:?}", status, delay);
-                        tokio::time::sleep(delay).await;
-                    } else {
-                        let error_body = resp.text().await.unwrap_or_else(|e| format!("<failed to read body: {}>", e));
-                        error!(status = %status, body = error_body, "AI inference API error");
-                        return None;
-                    }
-                }
-                Err(e) if e.is_timeout() || e.is_connect() => {
-                    let delay = std::time::Duration::from_secs(2u64.pow(attempt));
-                    warn!(error = %e, "Network error, retrying in {:?}", delay);
-                    tokio::time::sleep(delay).await;
-                }
-                Err(e) => {
-                    error!(error = %e, "AI inference HTTP request failed");
-                    return None;
-                }
-            }
-        }
-
-        let response = match response {
+                .json(&body),
+            3,
+            "AI inference",
+        ).await {
             Some(r) => r,
-            None => {
-                error!("AI inference failed after {} retries", max_retries);
-                return None;
-            }
+            None => return None,
         };
 
         #[derive(serde::Deserialize)]
@@ -538,22 +536,13 @@ Requirements for name:
 
         debug!(response_len = text.len(), "Received AI inference response");
 
-        // Extract JSON from response
-        let json_start = match text.find('{') {
-            Some(i) => i,
+        let json_text = match extract_json_from_text(&text) {
+            Some(j) => j,
             None => {
                 error!("No JSON object found in AI response");
                 return None;
             }
         };
-        let json_end = match text.rfind('}') {
-            Some(i) => i,
-            None => {
-                error!("No closing brace found in AI response");
-                return None;
-            }
-        };
-        let json_text = &text[json_start..=json_end];
 
         let result: LlmResult = match serde_json::from_str(json_text) {
             Ok(r) => r,
@@ -563,24 +552,14 @@ Requirements for name:
             }
         };
 
-        // Sanitize name
-        let sanitized_name: String = result.name
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-            .collect();
-
-        if sanitized_name.is_empty() || sanitized_name.len() > MAX_SKILL_NAME_LEN {
-            error!(name = sanitized_name, "Invalid skill name after sanitization");
-            return None;
-        }
-
-        // Sanitize category
-        let sanitized_category: Option<String> = result.category.map(|c| {
-            c.chars()
-                .filter(|ch| ch.is_alphanumeric() || *ch == '-' || *ch == '_')
-                .collect::<String>()
-                .to_lowercase()
-        }).filter(|s| !s.is_empty());
+        let sanitized_name = match sanitize_skill_name(&result.name) {
+            Some(n) => n,
+            None => {
+                error!(name = result.name, "Invalid skill name after sanitization");
+                return None;
+            }
+        };
+        let sanitized_category = sanitize_category(result.category);
 
         info!(
             name = sanitized_name,
@@ -589,7 +568,7 @@ Requirements for name:
         );
 
         Some(InferredSkillMeta {
-            name: sanitized_name.to_lowercase(),
+            name: sanitized_name,
             description: result.description,
             category: sanitized_category,
         })
@@ -1039,4 +1018,254 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- sanitize_filename tests ---
+
+    #[test]
+    fn test_sanitize_filename_valid_name() {
+        assert_eq!(sanitize_filename("my-recording").unwrap(), "my-recording");
+    }
+
+    #[test]
+    fn test_sanitize_filename_with_spaces() {
+        assert_eq!(sanitize_filename("my recording").unwrap(), "my recording");
+    }
+
+    #[test]
+    fn test_sanitize_filename_blocks_path_traversal() {
+        assert!(sanitize_filename("../../../etc/passwd").is_err());
+        assert!(sanitize_filename("foo/../bar").is_err());
+        assert!(sanitize_filename("..").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_filename_strips_slashes() {
+        assert_eq!(sanitize_filename("a/b").unwrap(), "ab");
+        assert_eq!(sanitize_filename("a\\b").unwrap(), "ab");
+    }
+
+    #[test]
+    fn test_sanitize_filename_strips_control_chars() {
+        assert_eq!(sanitize_filename("abc\x00def").unwrap(), "abcdef");
+        assert_eq!(sanitize_filename("abc\ndef").unwrap(), "abcdef");
+    }
+
+    #[test]
+    fn test_sanitize_filename_rejects_empty() {
+        assert!(sanitize_filename("").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_filename_rejects_only_slashes() {
+        assert!(sanitize_filename("///").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_filename_rejects_too_long() {
+        let long_name = "a".repeat(256);
+        assert!(sanitize_filename(&long_name).is_err());
+    }
+
+    #[test]
+    fn test_sanitize_filename_accepts_max_length() {
+        let name = "a".repeat(255);
+        assert_eq!(sanitize_filename(&name).unwrap().len(), 255);
+    }
+
+    #[test]
+    fn test_sanitize_filename_unicode() {
+        assert_eq!(sanitize_filename("日本語テスト").unwrap(), "日本語テスト");
+    }
+
+    // --- Struct serialization tests ---
+
+    #[test]
+    fn test_recording_status_serialization() {
+        let status = RecordingStatus {
+            is_recording: true,
+            event_count: 42,
+            duration_seconds: 3.14,
+            has_accessibility: true,
+            has_screen_recording: false,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let deserialized: RecordingStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.event_count, 42);
+        assert!(deserialized.is_recording);
+        assert!(!deserialized.has_screen_recording);
+    }
+
+    #[test]
+    fn test_pipeline_stats_info_serialization() {
+        let stats = PipelineStatsInfo {
+            local_recovery_count: 1,
+            llm_enriched_count: 2,
+            goms_boundaries_count: 3,
+            context_transitions_count: 4,
+            unit_tasks_count: 5,
+            significant_events_count: 6,
+            trajectory_adjustments_count: 7,
+            variables_count: 8,
+            generated_steps_count: 9,
+            warnings: vec!["test warning".to_string()],
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let deserialized: PipelineStatsInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.warnings.len(), 1);
+        assert_eq!(deserialized.generated_steps_count, 9);
+    }
+
+    #[test]
+    fn test_generated_skill_info_serialization() {
+        let info = GeneratedSkillInfo {
+            name: "test-skill".to_string(),
+            path: "/tmp/test.md".to_string(),
+            steps_count: 5,
+            variables_count: 2,
+            stats: PipelineStatsInfo {
+                local_recovery_count: 0,
+                llm_enriched_count: 0,
+                goms_boundaries_count: 0,
+                context_transitions_count: 0,
+                unit_tasks_count: 0,
+                significant_events_count: 10,
+                trajectory_adjustments_count: 0,
+                variables_count: 2,
+                generated_steps_count: 5,
+                warnings: vec![],
+            },
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let deserialized: GeneratedSkillInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.name, "test-skill");
+        assert_eq!(deserialized.stats.significant_events_count, 10);
+        assert!(deserialized.stats.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_recording_info_serialization() {
+        let info = RecordingInfo {
+            name: "test".to_string(),
+            path: "/tmp/test.json".to_string(),
+            event_count: 100,
+            duration_ms: 5000,
+            created_at: "2026-02-08T00:00:00Z".to_string(),
+            goal: Some("Test goal".to_string()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let deserialized: RecordingInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.event_count, 100);
+        assert_eq!(deserialized.goal, Some("Test goal".to_string()));
+    }
+
+    #[test]
+    fn test_app_state_default() {
+        let state = AppState::default();
+        assert!(state.recording.lock().unwrap().is_none());
+        assert!(state.event_tap.lock().unwrap().is_none());
+        assert!(state.consumer.lock().unwrap().is_none());
+        assert!(!*state.is_recording.lock().unwrap());
+        assert!(state.api_key.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_ui_config_serialization_roundtrip() {
+        let config = UiConfig {
+            rdp_epsilon_px: 2.0,
+            hesitation_threshold: 150.0,
+            min_pause_ms: 300,
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            temperature: 0.7,
+            use_action_clustering: true,
+            use_local_recovery: true,
+            use_vision_ocr: false,
+            use_trajectory_analysis: true,
+            use_goms_detection: true,
+            use_context_tracking: true,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: UiConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.model, "claude-sonnet-4-5-20250929");
+        assert!(!deserialized.use_vision_ocr);
+        assert!((deserialized.temperature - 0.7).abs() < f32::EPSILON);
+    }
+
+    // --- extract_json_from_text tests ---
+
+    #[test]
+    fn test_extract_json_simple() {
+        let text = r#"Here is the result: {"name": "test"} done"#;
+        assert_eq!(extract_json_from_text(text), Some(r#"{"name": "test"}"#));
+    }
+
+    #[test]
+    fn test_extract_json_nested() {
+        let text = r#"{"outer": {"inner": 1}}"#;
+        assert_eq!(extract_json_from_text(text), Some(r#"{"outer": {"inner": 1}}"#));
+    }
+
+    #[test]
+    fn test_extract_json_no_json() {
+        assert_eq!(extract_json_from_text("no json here"), None);
+    }
+
+    #[test]
+    fn test_extract_json_only_open_brace() {
+        assert_eq!(extract_json_from_text("{ incomplete"), None);
+    }
+
+    // --- sanitize_skill_name tests ---
+
+    #[test]
+    fn test_sanitize_skill_name_valid() {
+        assert_eq!(sanitize_skill_name("send-gmail-email"), Some("send-gmail-email".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_skill_name_strips_special_chars() {
+        assert_eq!(sanitize_skill_name("my skill! #1"), Some("myskill1".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_skill_name_lowercases() {
+        assert_eq!(sanitize_skill_name("Send-Gmail"), Some("send-gmail".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_skill_name_empty_result() {
+        assert_eq!(sanitize_skill_name("!@#$"), None);
+    }
+
+    #[test]
+    fn test_sanitize_skill_name_too_long() {
+        let long = "a".repeat(51);
+        assert_eq!(sanitize_skill_name(&long), None);
+    }
+
+    // --- sanitize_category tests ---
+
+    #[test]
+    fn test_sanitize_category_valid() {
+        assert_eq!(sanitize_category(Some("email".to_string())), Some("email".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_category_strips_special() {
+        assert_eq!(sanitize_category(Some("web & apps".to_string())), Some("webapps".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_category_none() {
+        assert_eq!(sanitize_category(None), None);
+    }
+
+    #[test]
+    fn test_sanitize_category_empty_after_filter() {
+        assert_eq!(sanitize_category(Some("!@#".to_string())), None);
+    }
 }
