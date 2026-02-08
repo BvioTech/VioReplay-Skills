@@ -578,7 +578,6 @@ impl VisionFallback {
     }
 
     /// Fuse OCR and icon results into semantic context
-    #[allow(clippy::field_reassign_with_default)]
     fn fuse_results(
         &self,
         cursor_x: f64,
@@ -604,29 +603,22 @@ impl VisionFallback {
                 dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
             });
 
-        // Build semantic context
-        if closest_text.is_some() || closest_icon.is_some() {
-            let mut context = SemanticContext::default();
-            context.source = SemanticSource::Vision;
-
-            if let Some(text) = closest_text {
-                context.ocr_text = Some(text.text.clone());
-                context.title = Some(text.text.clone());
-                context.confidence = text.confidence;
-            }
-
-            if let Some(icon) = closest_icon {
-                // Infer role from icon type
-                context.ax_role = Some(format!("AX{}", icon.icon_type));
-                if context.confidence < icon.confidence {
-                    context.confidence = icon.confidence;
-                }
-            }
-
-            Some(context)
-        } else {
-            None
+        if closest_text.is_none() && closest_icon.is_none() {
+            return None;
         }
+
+        // Determine confidence: max of text and icon confidence
+        let text_conf = closest_text.map(|t| t.confidence).unwrap_or(0.0);
+        let icon_conf = closest_icon.map(|i| i.confidence).unwrap_or(0.0);
+
+        Some(SemanticContext {
+            source: SemanticSource::Vision,
+            ocr_text: closest_text.map(|t| t.text.clone()),
+            title: closest_text.map(|t| t.text.clone()),
+            ax_role: closest_icon.map(|i| format!("AX{}", i.icon_type)),
+            confidence: text_conf.max(icon_conf),
+            ..Default::default()
+        })
     }
 
     /// Calculate distance from point to region center

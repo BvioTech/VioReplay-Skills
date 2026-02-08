@@ -353,45 +353,42 @@ fn query_element_at_position(
 }
 
 /// Extract semantic context from an accessibility element
-#[allow(clippy::field_reassign_with_default)]
 fn extract_semantic_context(element: AXUIElementRef) -> SemanticContext {
-    let mut context = SemanticContext::default();
-
-    // Get role
-    context.ax_role = get_string_attribute(element, &attributes::role());
-
-    // Get title
-    context.title = get_string_attribute(element, &attributes::title())
+    // Query element attributes
+    let ax_role = get_string_attribute(element, &attributes::role());
+    let title = get_string_attribute(element, &attributes::title())
         .or_else(|| get_string_attribute(element, &attributes::description()));
-
-    // Get identifier
-    context.identifier = get_string_attribute(element, &attributes::identifier());
-
-    // Get value
-    context.value = get_string_attribute(element, &attributes::value());
+    let identifier = get_string_attribute(element, &attributes::identifier());
+    let value = get_string_attribute(element, &attributes::value());
 
     // Get PID
-    let mut pid: i32 = 0;
-    if unsafe { AXUIElementGetPid(element, &mut pid) } == K_AX_ERROR_SUCCESS {
-        context.pid = Some(pid);
-    }
+    let mut pid_val: i32 = 0;
+    let pid = if unsafe { AXUIElementGetPid(element, &mut pid_val) } == K_AX_ERROR_SUCCESS {
+        Some(pid_val)
+    } else {
+        None
+    };
 
     // Get parent info
-    if let Some(parent) = get_element_attribute(element, &attributes::parent()) {
-        context.parent_role = get_string_attribute(parent, &attributes::role());
-        context.parent_title = get_string_attribute(parent, &attributes::title());
-        unsafe {
-            CFRelease(parent);
+    let (parent_role, parent_title) = match get_element_attribute(element, &attributes::parent()) {
+        Some(parent) => {
+            let r = get_string_attribute(parent, &attributes::role());
+            let t = get_string_attribute(parent, &attributes::title());
+            unsafe { CFRelease(parent); }
+            (r, t)
         }
-    }
+        None => (None, None),
+    };
 
     // Get window info
-    if let Some(window) = get_element_attribute(element, &attributes::window()) {
-        context.window_title = get_string_attribute(window, &attributes::title());
-        unsafe {
-            CFRelease(window);
+    let window_title = match get_element_attribute(element, &attributes::window()) {
+        Some(window) => {
+            let t = get_string_attribute(window, &attributes::title());
+            unsafe { CFRelease(window); }
+            t
         }
-    }
+        None => None,
+    };
 
     // Build ancestor chain (up to 5 levels)
     let mut ancestors = Vec::new();
@@ -401,16 +398,14 @@ fn extract_semantic_context(element: AXUIElementRef) -> SemanticContext {
     while depth < 5 {
         if let Some(parent) = get_element_attribute(current, &attributes::parent()) {
             let role = get_string_attribute(parent, &attributes::role());
-            let title = get_string_attribute(parent, &attributes::title());
+            let t = get_string_attribute(parent, &attributes::title());
 
             if let Some(r) = role {
-                ancestors.push((r, title));
+                ancestors.push((r, t));
             }
 
             if current != element {
-                unsafe {
-                    CFRelease(current);
-                }
+                unsafe { CFRelease(current); }
             }
             current = parent;
             depth += 1;
@@ -420,16 +415,23 @@ fn extract_semantic_context(element: AXUIElementRef) -> SemanticContext {
     }
 
     if current != element && !current.is_null() {
-        unsafe {
-            CFRelease(current);
-        }
+        unsafe { CFRelease(current); }
     }
 
-    context.ancestors = ancestors;
-    context.source = SemanticSource::Accessibility;
-    context.confidence = 1.0;
-
-    context
+    SemanticContext {
+        ax_role,
+        title,
+        identifier,
+        value,
+        pid,
+        parent_role,
+        parent_title,
+        window_title,
+        ancestors,
+        source: SemanticSource::Accessibility,
+        confidence: 1.0,
+        ..Default::default()
+    }
 }
 
 /// Get a string attribute from an element

@@ -274,34 +274,25 @@ impl NullHandler {
     }
 
     /// Extract semantic context from an accessibility element
-    #[allow(clippy::field_reassign_with_default)]
     fn extract_semantic_context(&self, element: AXUIElementRef) -> SemanticContext {
-        let mut context = SemanticContext::default();
-
-        // Get role
-        context.ax_role = self.get_string_attribute(element, "AXRole");
-
-        // Get title or description
-        context.title = self.get_string_attribute(element, "AXTitle")
-            .or_else(|| self.get_string_attribute(element, "AXDescription"));
-
-        // Get identifier
-        context.identifier = self.get_string_attribute(element, "AXIdentifier");
-
-        // Get value
-        context.value = self.get_string_attribute(element, "AXValue");
-
-        // Get PID
         let mut pid: i32 = 0;
-        if unsafe { AXUIElementGetPid(element, &mut pid) } == K_AX_ERROR_SUCCESS {
-            context.pid = Some(pid);
+        let pid_result = if unsafe { AXUIElementGetPid(element, &mut pid) } == K_AX_ERROR_SUCCESS {
+            Some(pid)
+        } else {
+            None
+        };
+
+        SemanticContext {
+            ax_role: self.get_string_attribute(element, "AXRole"),
+            title: self.get_string_attribute(element, "AXTitle")
+                .or_else(|| self.get_string_attribute(element, "AXDescription")),
+            identifier: self.get_string_attribute(element, "AXIdentifier"),
+            value: self.get_string_attribute(element, "AXValue"),
+            pid: pid_result,
+            source: SemanticSource::Accessibility,
+            confidence: 0.85,
+            ..Default::default()
         }
-
-        // Mark as recovered via spiral search
-        context.source = SemanticSource::Accessibility;
-        context.confidence = 0.85; // Slightly lower confidence for recovered data
-
-        context
     }
 
     /// Get a string attribute from an element
