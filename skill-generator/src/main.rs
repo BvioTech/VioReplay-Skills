@@ -83,6 +83,28 @@ fn run_record(
     goal: Option<String>,
     config: &Config,
 ) -> anyhow::Result<()> {
+    // Recover any orphaned checkpoints from previous crashes
+    let recordings_dir = Cli::recordings_dir();
+    if recordings_dir.exists() {
+        let recovered = Recording::recover_checkpoints(&recordings_dir);
+        for (tmp_path, mut rec) in recovered {
+            let final_name = tmp_path.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_suffix(".json"))
+                .unwrap_or("recovered");
+            let final_path = recordings_dir.join(format!("{}.json", final_name));
+            if !final_path.exists() {
+                rec.finalize(rec.metadata.duration_ms);
+                if let Err(e) = rec.save(&final_path) {
+                    warn!("Failed to recover checkpoint: {}", e);
+                } else {
+                    info!("Recovered interrupted recording: {} ({} events)", final_name, rec.len());
+                }
+            }
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    }
+
     info!("Starting recording for {} seconds", duration);
 
     if let Some(g) = &goal {
@@ -127,6 +149,12 @@ fn run_record(
         stop_flag_handler.store(true, std::sync::atomic::Ordering::SeqCst);
     })?;
 
+    // Prepare output path for checkpoints
+    let recordings_dir = Cli::recordings_dir();
+    std::fs::create_dir_all(&recordings_dir)?;
+    let output_path = recordings_dir.join(format!("{}.json", output_name));
+    let mut last_checkpoint_count = 0usize;
+
     // Recording loop
     loop {
         // Check if we should stop
@@ -145,6 +173,15 @@ fn run_record(
             recording.add_raw_event(slot.event);
         }
 
+        // Auto-save checkpoint every CHECKPOINT_INTERVAL events
+        let current_count = recording.len();
+        if current_count >= last_checkpoint_count + skill_generator::workflow::recording::CHECKPOINT_INTERVAL {
+            if let Err(e) = recording.save_checkpoint(&output_path) {
+                warn!("Checkpoint save failed: {}", e);
+            }
+            last_checkpoint_count = current_count;
+        }
+
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
@@ -157,12 +194,9 @@ fn run_record(
     info!("Recording stopped after {:.1}s", elapsed.as_secs_f64());
     info!("Captured {} events", recording.len());
 
-    // Save recording
-    let recordings_dir = Cli::recordings_dir();
-    std::fs::create_dir_all(&recordings_dir)?;
-
-    let output_path = recordings_dir.join(format!("{}.json", output_name));
+    // Save final recording and clean up checkpoint
     recording.save(&output_path)?;
+    Recording::remove_checkpoint(&output_path);
     info!("Saved recording to {:?}", output_path);
 
     Ok(())

@@ -54,6 +54,8 @@ pub struct AppState {
     is_recording: Mutex<bool>,
     /// API key for LLM
     api_key: Mutex<Option<String>>,
+    /// Event count at last checkpoint (for auto-save)
+    last_checkpoint_count: Mutex<usize>,
 }
 
 impl Default for AppState {
@@ -64,6 +66,7 @@ impl Default for AppState {
             consumer: Mutex::new(None),
             is_recording: Mutex::new(false),
             api_key: Mutex::new(None),
+            last_checkpoint_count: Mutex::new(0),
         }
     }
 }
@@ -199,6 +202,10 @@ fn start_recording(state: State<AppState>, name: String, goal: Option<String>) -
         let mut is_rec = state.is_recording.lock().map_err(|e| e.to_string())?;
         *is_rec = true;
     }
+    {
+        let mut last_cp = state.last_checkpoint_count.lock().map_err(|e| e.to_string())?;
+        *last_cp = 0;
+    }
 
     Ok(())
 }
@@ -230,6 +237,18 @@ fn get_recording_status(state: State<AppState>) -> Result<RecordingStatus, Strin
                 rec.add_raw_event(slot.event);
             }
             event_count = rec.len();
+
+            // Auto-save checkpoint every CHECKPOINT_INTERVAL events
+            let mut last_cp = state.last_checkpoint_count.lock().map_err(|e| e.to_string())?;
+            if event_count >= *last_cp + skill_generator::workflow::recording::CHECKPOINT_INTERVAL {
+                let recordings_dir = dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".skill_generator")
+                    .join("recordings");
+                let cp_path = recordings_dir.join(format!("{}.json", rec.metadata.name));
+                let _ = rec.save_checkpoint(&cp_path);
+                *last_cp = event_count;
+            }
         }
     }
 
@@ -306,6 +325,7 @@ fn stop_recording(state: State<AppState>) -> Result<RecordingInfo, String> {
 
             let file_path = recordings_dir.join(format!("{}.json", rec.metadata.name));
             rec.save(&file_path).map_err(|e| e.to_string())?;
+            Recording::remove_checkpoint(&file_path);
 
             let info = RecordingInfo {
                 name: rec.metadata.name.clone(),

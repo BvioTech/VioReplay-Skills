@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uuid::Uuid;
 
+/// Checkpoint interval: save every N events
+pub const CHECKPOINT_INTERVAL: usize = 100;
+
+/// Get the checkpoint (temporary) path for a recording file
+fn checkpoint_path(final_path: &Path) -> std::path::PathBuf {
+    final_path.with_extension("json.tmp")
+}
+
 /// Recording metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordingMetadata {
@@ -103,6 +111,54 @@ impl Recording {
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(path, json)?;
         Ok(())
+    }
+
+    /// Save a checkpoint to a temporary file for crash recovery.
+    ///
+    /// Writes to `<path>.tmp` so that if the process crashes, the recording
+    /// can be recovered on next launch.
+    pub fn save_checkpoint(&self, final_path: &Path) -> crate::Result<()> {
+        let tmp_path = checkpoint_path(final_path);
+        let json = serde_json::to_string(self)?; // compact JSON for speed
+        std::fs::write(&tmp_path, json)?;
+        Ok(())
+    }
+
+    /// Finalize a checkpoint by renaming `.tmp` to the final path.
+    ///
+    /// This is an atomic operation on most filesystems, ensuring no data loss.
+    pub fn finalize_checkpoint(final_path: &Path) -> crate::Result<()> {
+        let tmp_path = checkpoint_path(final_path);
+        if tmp_path.exists() {
+            std::fs::rename(&tmp_path, final_path)?;
+        }
+        Ok(())
+    }
+
+    /// Remove a checkpoint file if it exists (e.g., after successful save).
+    pub fn remove_checkpoint(final_path: &Path) {
+        let tmp_path = checkpoint_path(final_path);
+        let _ = std::fs::remove_file(tmp_path);
+    }
+
+    /// Find and recover any orphaned checkpoint files in a directory.
+    ///
+    /// Returns a list of (checkpoint_path, recovered_recording) pairs.
+    pub fn recover_checkpoints(dir: &Path) -> Vec<(std::path::PathBuf, Recording)> {
+        let mut recovered = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map(|e| e == "tmp").unwrap_or(false) {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if let Ok(recording) = serde_json::from_str::<Recording>(&content) {
+                            recovered.push((path, recording));
+                        }
+                    }
+                }
+            }
+        }
+        recovered
     }
 
     /// Load recording from a file
@@ -449,5 +505,88 @@ mod tests {
         // Approximately 333 of each type
         assert!(clicks.len() >= 330 && clicks.len() <= 340);
         assert!(keyboard.len() >= 330 && keyboard.len() <= 340);
+    }
+
+    #[test]
+    fn test_checkpoint_save_and_recover() {
+        MachTimebase::init();
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("test_recording.json");
+
+        let mut recording = Recording::new("checkpoint_test".to_string(), Some("Testing checkpoints".to_string()));
+        recording.add_raw_event(make_test_raw_event(EventType::LeftMouseDown, 10.0, 20.0));
+        recording.add_raw_event(make_test_raw_event(EventType::KeyDown, 0.0, 0.0));
+
+        // Save checkpoint
+        recording.save_checkpoint(&final_path).unwrap();
+
+        // Checkpoint file should exist, final file should not
+        let tmp_path = final_path.with_extension("json.tmp");
+        assert!(tmp_path.exists());
+        assert!(!final_path.exists());
+
+        // Recover checkpoints from directory
+        let recovered = Recording::recover_checkpoints(dir.path());
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].1.metadata.name, "checkpoint_test");
+        assert_eq!(recovered[0].1.len(), 2);
+    }
+
+    #[test]
+    fn test_finalize_checkpoint_renames() {
+        MachTimebase::init();
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("rename_test.json");
+
+        let recording = Recording::new("rename_test".to_string(), None);
+        recording.save_checkpoint(&final_path).unwrap();
+
+        // Finalize: rename .tmp to .json
+        Recording::finalize_checkpoint(&final_path).unwrap();
+
+        assert!(final_path.exists());
+        assert!(!final_path.with_extension("json.tmp").exists());
+
+        // Load the finalized file
+        let loaded = Recording::load(&final_path).unwrap();
+        assert_eq!(loaded.metadata.name, "rename_test");
+    }
+
+    #[test]
+    fn test_remove_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("remove_test.json");
+        let tmp_path = final_path.with_extension("json.tmp");
+
+        // Create a fake checkpoint file
+        std::fs::write(&tmp_path, "{}").unwrap();
+        assert!(tmp_path.exists());
+
+        // Remove it
+        Recording::remove_checkpoint(&final_path);
+        assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn test_recover_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let recovered = Recording::recover_checkpoints(dir.path());
+        assert!(recovered.is_empty());
+    }
+
+    #[test]
+    fn test_recover_ignores_invalid_tmp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write an invalid .tmp file
+        std::fs::write(dir.path().join("bad.json.tmp"), "not valid json").unwrap();
+
+        let recovered = Recording::recover_checkpoints(dir.path());
+        assert!(recovered.is_empty());
+    }
+
+    #[test]
+    fn test_checkpoint_path_helper() {
+        let path = Path::new("/tmp/my_recording.json");
+        assert_eq!(checkpoint_path(path), Path::new("/tmp/my_recording.json.tmp"));
     }
 }
