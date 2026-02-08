@@ -15,12 +15,12 @@ fn cached_patterns() -> &'static CachedPatterns {
     static PATTERNS: OnceLock<CachedPatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| CachedPatterns {
         hardcoded: vec![
-            Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap(),
-            Regex::new(r"\d{4}-\d{2}-\d{2}").unwrap(),
-            Regex::new(r"\d{2}/\d{2}/\d{4}").unwrap(),
-            Regex::new(r"\d{3}[-.]?\d{3}[-.]?\d{4}").unwrap(),
+            Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").expect("valid email regex"),
+            Regex::new(r"\d{4}-\d{2}-\d{2}").expect("valid date regex"),
+            Regex::new(r"\d{2}/\d{2}/\d{4}").expect("valid date regex"),
+            Regex::new(r"\d{3}[-.]?\d{3}[-.]?\d{4}").expect("valid phone regex"),
         ],
-        variable: Regex::new(r"\{\{([^}]+)\}\}").unwrap(),
+        variable: Regex::new(r"\{\{([^}]+)\}\}").expect("valid variable regex"),
     })
 }
 

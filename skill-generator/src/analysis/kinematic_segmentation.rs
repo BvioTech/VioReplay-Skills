@@ -130,7 +130,7 @@ impl KinematicSegmenter {
 
         // Calculate total duration
         let total_duration_ms = if points.len() >= 2 {
-            MachTimebase::elapsed_millis(points[0].timestamp_ticks, points.last().unwrap().timestamp_ticks)
+            MachTimebase::elapsed_millis(points[0].timestamp_ticks, points.last().expect("len >= 2").timestamp_ticks)
         } else {
             0
         };
@@ -254,7 +254,7 @@ impl KinematicSegmenter {
         };
 
         let duration_ms = if points.len() >= 2 {
-            MachTimebase::elapsed_millis(points[0].timestamp_ticks, points.last().unwrap().timestamp_ticks)
+            MachTimebase::elapsed_millis(points[0].timestamp_ticks, points.last().expect("len >= 2").timestamp_ticks)
         } else {
             0
         };
@@ -289,7 +289,7 @@ impl KinematicSegmenter {
         if let Some(segment) = ballistic {
             if segment.points.len() >= 2 {
                 let start = &segment.points[0];
-                let end = segment.points.last().unwrap();
+                let end = segment.points.last().expect("len >= 2");
 
                 let dx = end.x - start.x;
                 let dy = end.y - start.y;
@@ -304,7 +304,7 @@ impl KinematicSegmenter {
         // Fallback: use overall trajectory direction
         if points.len() >= 2 {
             let start = &points[0];
-            let end = points.last().unwrap();
+            let end = points.last().expect("len >= 2");
 
             let dx = end.x - start.x;
             let dy = end.y - start.y;
@@ -638,6 +638,54 @@ mod tests {
             // Total distance should be approximately 3 + 4 = 7
             assert!(total_distance > 6.0 && total_distance < 8.0);
         }
+    }
+
+    #[test]
+    fn test_two_point_trajectory() {
+        MachTimebase::init();
+        let segmenter = KinematicSegmenter::new();
+
+        let points = vec![
+            make_point(0.0, 0.0, 0),
+            make_point(100.0, 0.0, 1_000_000_000),
+        ];
+
+        let analysis = segmenter.analyze(&points);
+        assert!(analysis.total_duration_ms > 0);
+        assert!(analysis.velocity_profile.len() == 2);
+    }
+
+    #[test]
+    fn test_zero_time_delta_points() {
+        MachTimebase::init();
+        let segmenter = KinematicSegmenter::new();
+
+        // Two points at the same timestamp
+        let points = vec![
+            make_point(0.0, 0.0, 0),
+            make_point(100.0, 0.0, 0),
+            make_point(200.0, 0.0, 1_000_000_000),
+        ];
+
+        // Should not panic despite zero time delta
+        let analysis = segmenter.analyze(&points);
+        assert_eq!(analysis.velocity_profile.len(), 3);
+    }
+
+    #[test]
+    fn test_stationary_ballistic_vector() {
+        MachTimebase::init();
+        let segmenter = KinematicSegmenter::new();
+
+        // Nearly stationary - no meaningful direction
+        let points = vec![
+            make_point(100.0, 100.0, 0),
+            make_point(100.0, 100.0, 1_000_000_000),
+            make_point(100.0, 100.0, 2_000_000_000),
+        ];
+
+        let analysis = segmenter.analyze(&points);
+        assert!(analysis.ballistic_vector.is_none());
     }
 
     #[test]

@@ -152,9 +152,9 @@ impl LlmSynthesizer {
         self.cache.get(key).and_then(|entry| {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs();
-            if now - entry.timestamp < self.cache_ttl {
+            if now.saturating_sub(entry.timestamp) < self.cache_ttl {
                 Some(entry.result.clone())
             } else {
                 None
@@ -166,7 +166,7 @@ impl LlmSynthesizer {
     fn cache_result(&mut self, key: &str, result: &SynthesisResult) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         self.cache.insert(
             key.to_string(),
@@ -314,10 +314,10 @@ Respond in JSON format:
     pub fn cleanup_cache(&mut self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
-        self.cache.retain(|_, entry| now - entry.timestamp < self.cache_ttl);
+        self.cache.retain(|_, entry| now.saturating_sub(entry.timestamp) < self.cache_ttl);
     }
 }
 

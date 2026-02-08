@@ -463,13 +463,8 @@ function App() {
       loadSkills();
 
       // Load preview
-      try {
-        const content = await invoke<string>("read_skill_file", { path: skill.path });
-        setPreviewContent(content);
-        setPreviewName(skill.name);
-      } catch {
-        // Preview is optional
-      }
+      const content = await readSkillFile(skill.path);
+      if (content) { setPreviewContent(content); setPreviewName(skill.name); }
     } catch (e: unknown) {
       const errorMsg = e instanceof Error ? e.message : String(e);
       if (errorMsg.includes("Accessibility")) {
@@ -559,18 +554,15 @@ function App() {
   }
 
   async function handleDownloadSkill(path: string, name: string) {
-    try {
-      const content = await invoke<string>("read_skill_file", { path });
-      const blob = new Blob([content], { type: "text/markdown" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${name}-SKILL.md`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch {
-      setError("Failed to download skill file");
-    }
+    const content = await readSkillFile(path);
+    if (!content) return;
+    const blob = new Blob([content], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${name}-SKILL.md`;
+    a.click();
+    URL.revokeObjectURL(url);
   }
 
   async function handleExportConfig() {
@@ -652,6 +644,24 @@ function App() {
       }
     } else {
       setConfirmDeleteSkill(path);
+    }
+  }
+
+  async function readSkillFile(path: string): Promise<string | null> {
+    try {
+      return await invoke<string>("read_skill_file", { path });
+    } catch {
+      setError("Failed to load skill file");
+      return null;
+    }
+  }
+
+  async function copyToClipboard(text: string, label = "Copied to clipboard") {
+    try {
+      await navigator.clipboard.writeText(text);
+      setSuccess(label);
+    } catch {
+      setError("Failed to copy to clipboard");
     }
   }
 
@@ -837,7 +847,7 @@ function App() {
                 <div className="preview-actions">
                   <button
                     className="btn btn-small"
-                    onClick={() => navigator.clipboard.writeText(previewContent).then(() => setSuccess("Copied to clipboard"))}
+                    onClick={() => copyToClipboard(previewContent)}
                     aria-label="Copy generated skill to clipboard"
                   >
                     Copy
@@ -975,13 +985,8 @@ function App() {
                           <button
                             className="btn btn-small"
                             onClick={async () => {
-                              try {
-                                const content = await invoke<string>("read_skill_file", { path: generatedSkills[rec.path] });
-                                setPreviewContent(content);
-                                setPreviewName(rec.name);
-                              } catch {
-                                setError("Failed to load skill preview");
-                              }
+                              const content = await readSkillFile(generatedSkills[rec.path]);
+                              if (content) { setPreviewContent(content); setPreviewName(rec.name); }
                             }}
                             title="Preview SKILL.md"
                           >
@@ -990,13 +995,8 @@ function App() {
                           <button
                             className="btn btn-small"
                             onClick={async () => {
-                              try {
-                                const content = await invoke<string>("read_skill_file", { path: generatedSkills[rec.path] });
-                                await navigator.clipboard.writeText(content);
-                                setSuccess("SKILL.md copied to clipboard");
-                              } catch {
-                                setError("Failed to copy skill");
-                              }
+                              const content = await readSkillFile(generatedSkills[rec.path]);
+                              if (content) await copyToClipboard(content, "SKILL.md copied to clipboard");
                             }}
                             title="Copy SKILL.md"
                           >
@@ -1046,7 +1046,7 @@ function App() {
                 <div className="preview-actions">
                   <button
                     className="btn btn-small"
-                    onClick={() => navigator.clipboard.writeText(skillPreviewContent).then(() => setSuccess("Copied to clipboard"))}
+                    onClick={() => copyToClipboard(skillPreviewContent!)}
                     aria-label="Copy skill to clipboard"
                   >
                     Copy
@@ -1098,13 +1098,8 @@ function App() {
                       <button
                         className="btn btn-small"
                         onClick={async () => {
-                          try {
-                            const content = await invoke<string>("read_skill_file", { path: skill.path });
-                            setSkillPreviewContent(content);
-                            setSkillPreviewName(skill.name);
-                          } catch {
-                            setError("Failed to load skill");
-                          }
+                          const content = await readSkillFile(skill.path);
+                          if (content) { setSkillPreviewContent(content); setSkillPreviewName(skill.name); }
                         }}
                       >
                         Preview
@@ -1112,13 +1107,8 @@ function App() {
                       <button
                         className="btn btn-small"
                         onClick={async () => {
-                          try {
-                            const content = await invoke<string>("read_skill_file", { path: skill.path });
-                            await navigator.clipboard.writeText(content);
-                            setSuccess("Copied to clipboard");
-                          } catch {
-                            setError("Failed to copy skill");
-                          }
+                          const content = await readSkillFile(skill.path);
+                          if (content) await copyToClipboard(content);
                         }}
                       >
                         Copy
