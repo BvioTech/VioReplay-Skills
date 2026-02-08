@@ -19,11 +19,24 @@ interface RecordingInfo {
   goal: string | null;
 }
 
+interface PipelineStatsInfo {
+  local_recovery_count: number;
+  llm_enriched_count: number;
+  goms_boundaries_count: number;
+  context_transitions_count: number;
+  unit_tasks_count: number;
+  significant_events_count: number;
+  trajectory_adjustments_count: number;
+  variables_count: number;
+  generated_steps_count: number;
+}
+
 interface GeneratedSkillInfo {
   name: string;
   path: string;
   steps_count: number;
   variables_count: number;
+  stats: PipelineStatsInfo;
 }
 
 interface UiConfig {
@@ -32,6 +45,12 @@ interface UiConfig {
   min_pause_ms: number;
   model: string;
   temperature: number;
+  use_action_clustering: boolean;
+  use_local_recovery: boolean;
+  use_vision_ocr: boolean;
+  use_trajectory_analysis: boolean;
+  use_goms_detection: boolean;
+  use_context_tracking: boolean;
 }
 
 interface SkillListEntry {
@@ -43,6 +62,128 @@ interface SkillListEntry {
 }
 
 type Tab = "record" | "recordings" | "skills" | "settings";
+
+function MarkdownPreview({ content }: { content: string }) {
+  const lines = content.split("\n");
+  const elements: React.ReactNode[] = [];
+  let i = 0;
+  let key = 0;
+
+  function renderInline(text: string): React.ReactNode[] {
+    const parts: React.ReactNode[] = [];
+    let remaining = text;
+    let partKey = 0;
+
+    while (remaining.length > 0) {
+      // Inline code
+      const codeMatch = remaining.match(/^`([^`]+)`/);
+      if (codeMatch) {
+        parts.push(<code key={partKey++} className="md-inline-code">{codeMatch[1]}</code>);
+        remaining = remaining.slice(codeMatch[0].length);
+        continue;
+      }
+      // Bold
+      const boldMatch = remaining.match(/^\*\*([^*]+)\*\*/);
+      if (boldMatch) {
+        parts.push(<strong key={partKey++}>{boldMatch[1]}</strong>);
+        remaining = remaining.slice(boldMatch[0].length);
+        continue;
+      }
+      // Italic
+      const italicMatch = remaining.match(/^\*([^*]+)\*/);
+      if (italicMatch) {
+        parts.push(<em key={partKey++}>{italicMatch[1]}</em>);
+        remaining = remaining.slice(italicMatch[0].length);
+        continue;
+      }
+      // Plain char
+      const nextSpecial = remaining.slice(1).search(/[`*]/);
+      if (nextSpecial === -1) {
+        parts.push(remaining);
+        break;
+      }
+      parts.push(remaining.slice(0, nextSpecial + 1));
+      remaining = remaining.slice(nextSpecial + 1);
+    }
+    return parts;
+  }
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Code block
+    if (line.startsWith("```")) {
+      const lang = line.slice(3).trim();
+      const codeLines: string[] = [];
+      i++;
+      while (i < lines.length && !lines[i].startsWith("```")) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      i++; // skip closing ```
+      elements.push(
+        <pre key={key++} className="md-code-block" data-lang={lang || undefined}>
+          <code>{codeLines.join("\n")}</code>
+        </pre>
+      );
+      continue;
+    }
+
+    // Heading
+    const headingMatch = line.match(/^(#{1,4})\s+(.*)/);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      const text = renderInline(headingMatch[2]);
+      if (level === 1) elements.push(<h1 key={key++} className="md-heading">{text}</h1>);
+      else if (level === 2) elements.push(<h2 key={key++} className="md-heading">{text}</h2>);
+      else if (level === 3) elements.push(<h3 key={key++} className="md-heading">{text}</h3>);
+      else elements.push(<h4 key={key++} className="md-heading">{text}</h4>);
+      i++;
+      continue;
+    }
+
+    // Horizontal rule
+    if (/^---+\s*$/.test(line)) {
+      elements.push(<hr key={key++} className="md-hr" />);
+      i++;
+      continue;
+    }
+
+    // List item
+    if (/^[-*]\s/.test(line)) {
+      const items: React.ReactNode[] = [];
+      while (i < lines.length && /^[-*]\s/.test(lines[i])) {
+        items.push(<li key={items.length}>{renderInline(lines[i].replace(/^[-*]\s/, ""))}</li>);
+        i++;
+      }
+      elements.push(<ul key={key++} className="md-list">{items}</ul>);
+      continue;
+    }
+
+    // Numbered list
+    if (/^\d+\.\s/.test(line)) {
+      const items: React.ReactNode[] = [];
+      while (i < lines.length && /^\d+\.\s/.test(lines[i])) {
+        items.push(<li key={items.length}>{renderInline(lines[i].replace(/^\d+\.\s/, ""))}</li>);
+        i++;
+      }
+      elements.push(<ol key={key++} className="md-list">{items}</ol>);
+      continue;
+    }
+
+    // Empty line
+    if (line.trim() === "") {
+      i++;
+      continue;
+    }
+
+    // Paragraph
+    elements.push(<p key={key++} className="md-paragraph">{renderInline(line)}</p>);
+    i++;
+  }
+
+  return <div className="md-preview">{elements}</div>;
+}
 
 function App() {
   // Recording state
@@ -82,6 +223,9 @@ function App() {
   const [skillPreviewContent, setSkillPreviewContent] = useState<string | null>(null);
   const [skillPreviewName, setSkillPreviewName] = useState<string | null>(null);
   const [confirmDeleteSkill, setConfirmDeleteSkill] = useState<string | null>(null);
+
+  // Pipeline stats
+  const [pipelineStats, setPipelineStats] = useState<PipelineStatsInfo | null>(null);
 
   // Config state
   const [config, setConfig] = useState<UiConfig | null>(null);
@@ -246,12 +390,14 @@ function App() {
     setSuccess(null);
     setPreviewContent(null);
     setPreviewName(null);
+    setPipelineStats(null);
     setGenerating(recordingPath);
     try {
       const skill = await invoke<GeneratedSkillInfo>("generate_skill", {
         recordingPath
       });
       setSuccess(`SKILL.md generated: ${skill.name} (${skill.steps_count} steps, ${skill.variables_count} variables)`);
+      setPipelineStats(skill.stats);
       setGeneratedSkills(prev => ({ ...prev, [recordingPath]: skill.path }));
       loadSkills();
 
@@ -554,7 +700,60 @@ function App() {
                   </button>
                 </div>
               </div>
-              <pre className="skill-preview">{previewContent}</pre>
+              <MarkdownPreview content={previewContent} />
+            </section>
+          )}
+
+          {/* Pipeline Stats */}
+          {pipelineStats && (
+            <section className="panel stats-panel">
+              <div className="preview-header">
+                <h2 className="panel-title">Pipeline Statistics</h2>
+                <button
+                  className="btn btn-small"
+                  onClick={() => setPipelineStats(null)}
+                >
+                  Dismiss
+                </button>
+              </div>
+              <div className="stats-grid">
+                <div className="stat-item">
+                  <span className="stat-number">{pipelineStats.significant_events_count}</span>
+                  <span className="stat-desc">Significant Events</span>
+                </div>
+                <div className="stat-item">
+                  <span className="stat-number">{pipelineStats.generated_steps_count}</span>
+                  <span className="stat-desc">Generated Steps</span>
+                </div>
+                <div className="stat-item">
+                  <span className="stat-number">{pipelineStats.variables_count}</span>
+                  <span className="stat-desc">Variables Extracted</span>
+                </div>
+                <div className="stat-item">
+                  <span className="stat-number">{pipelineStats.unit_tasks_count}</span>
+                  <span className="stat-desc">Unit Tasks</span>
+                </div>
+                <div className="stat-item">
+                  <span className="stat-number">{pipelineStats.goms_boundaries_count}</span>
+                  <span className="stat-desc">GOMS Boundaries</span>
+                </div>
+                <div className="stat-item">
+                  <span className="stat-number">{pipelineStats.context_transitions_count}</span>
+                  <span className="stat-desc">Context Transitions</span>
+                </div>
+                <div className="stat-item">
+                  <span className="stat-number">{pipelineStats.local_recovery_count}</span>
+                  <span className="stat-desc">Local Recoveries</span>
+                </div>
+                <div className="stat-item">
+                  <span className="stat-number">{pipelineStats.llm_enriched_count}</span>
+                  <span className="stat-desc">LLM Enriched</span>
+                </div>
+                <div className="stat-item">
+                  <span className="stat-number">{pipelineStats.trajectory_adjustments_count}</span>
+                  <span className="stat-desc">Trajectory Adjustments</span>
+                </div>
+              </div>
             </section>
           )}
 
@@ -676,7 +875,7 @@ function App() {
                   </button>
                 </div>
               </div>
-              <pre className="skill-preview">{skillPreviewContent}</pre>
+              <MarkdownPreview content={skillPreviewContent} />
             </section>
           )}
 
@@ -841,6 +1040,63 @@ function App() {
                     onChange={(e) => { const v = parseFloat(e.target.value); if (!Number.isNaN(v)) setConfig({ ...config, temperature: v }); }}
                   />
                 </label>
+
+                <h3 className="config-section-title">Pipeline Features</h3>
+                <label className="toggle-label">
+                  <input
+                    type="checkbox"
+                    checked={config.use_action_clustering}
+                    onChange={(e) => setConfig({ ...config, use_action_clustering: e.target.checked })}
+                  />
+                  <span>Action Clustering</span>
+                  <span className="config-hint">Group events into UnitTasks before step generation</span>
+                </label>
+                <label className="toggle-label">
+                  <input
+                    type="checkbox"
+                    checked={config.use_local_recovery}
+                    onChange={(e) => setConfig({ ...config, use_local_recovery: e.target.checked })}
+                  />
+                  <span>Local Recovery</span>
+                  <span className="config-hint">AX retry + spiral search for missing semantic data</span>
+                </label>
+                <label className="toggle-label">
+                  <input
+                    type="checkbox"
+                    checked={config.use_vision_ocr}
+                    onChange={(e) => setConfig({ ...config, use_vision_ocr: e.target.checked })}
+                  />
+                  <span>Vision OCR</span>
+                  <span className="config-hint">Apple Vision framework fallback for text recognition</span>
+                </label>
+                <label className="toggle-label">
+                  <input
+                    type="checkbox"
+                    checked={config.use_trajectory_analysis}
+                    onChange={(e) => setConfig({ ...config, use_trajectory_analysis: e.target.checked })}
+                  />
+                  <span>Trajectory Analysis</span>
+                  <span className="config-hint">RDP simplification + Fitts' Law kinematic profiling</span>
+                </label>
+                <label className="toggle-label">
+                  <input
+                    type="checkbox"
+                    checked={config.use_goms_detection}
+                    onChange={(e) => setConfig({ ...config, use_goms_detection: e.target.checked })}
+                  />
+                  <span>GOMS Detection</span>
+                  <span className="config-hint">Cognitive boundary analysis via mental operator pauses</span>
+                </label>
+                <label className="toggle-label">
+                  <input
+                    type="checkbox"
+                    checked={config.use_context_tracking}
+                    onChange={(e) => setConfig({ ...config, use_context_tracking: e.target.checked })}
+                  />
+                  <span>Context Tracking</span>
+                  <span className="config-hint">Track window/app focus changes during generation</span>
+                </label>
+
                 <button className="btn btn-primary" onClick={handleSaveConfig}>
                   Save Configuration
                 </button>
@@ -858,7 +1114,7 @@ function App() {
             </p>
             <div className="about-meta">
               <span>v0.1.0</span>
-              <span>584 tests passing</span>
+              <span>609 tests passing</span>
             </div>
           </section>
         </div>

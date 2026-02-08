@@ -71,6 +71,20 @@ pub struct RecordingStatus {
     pub has_screen_recording: bool,
 }
 
+/// Pipeline statistics for the frontend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineStatsInfo {
+    pub local_recovery_count: usize,
+    pub llm_enriched_count: usize,
+    pub goms_boundaries_count: usize,
+    pub context_transitions_count: usize,
+    pub unit_tasks_count: usize,
+    pub significant_events_count: usize,
+    pub trajectory_adjustments_count: usize,
+    pub variables_count: usize,
+    pub generated_steps_count: usize,
+}
+
 /// Generated skill info
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneratedSkillInfo {
@@ -78,6 +92,7 @@ pub struct GeneratedSkillInfo {
     pub path: String,
     pub steps_count: usize,
     pub variables_count: usize,
+    pub stats: PipelineStatsInfo,
 }
 
 /// Check if accessibility permissions are granted
@@ -555,9 +570,21 @@ fn generate_skill(state: State<AppState>, recording_path: String) -> Result<Gene
     let recording = Recording::load(path).map_err(|e| e.to_string())?;
     info!(event_count = recording.len(), "Recording loaded");
 
-    // Create generator with API key from state
+    // Load config for pipeline settings and model name
+    let config = Config::load_default().unwrap_or_else(|e| {
+        warn!("Failed to load config, using defaults: {}", e);
+        Config::default()
+    });
+
+    // Create generator with API key and pipeline config from state
     let gen_config = skill_generator::workflow::generator::GeneratorConfig {
         api_key: api_key_value.clone(),
+        use_action_clustering: config.pipeline.use_action_clustering,
+        use_local_recovery: config.pipeline.use_local_recovery,
+        use_vision_ocr: config.pipeline.use_vision_ocr,
+        use_trajectory_analysis: config.pipeline.use_trajectory_analysis,
+        use_goms_detection: config.pipeline.use_goms_detection,
+        use_context_tracking: config.pipeline.use_context_tracking,
         ..Default::default()
     };
     let generator = SkillGenerator::with_config(gen_config);
@@ -572,12 +599,6 @@ fn generate_skill(state: State<AppState>, recording_path: String) -> Result<Gene
         .map(|s| format!("- {}", s.description))
         .collect::<Vec<_>>()
         .join("\n");
-
-    // Read model from config and pass API key
-    let config = Config::load_default().unwrap_or_else(|e| {
-        warn!("Failed to load config, using defaults: {}", e);
-        Config::default()
-    });
     let inferred = infer_skill_from_recording(
         &recording,
         &steps_summary,
@@ -619,6 +640,17 @@ fn generate_skill(state: State<AppState>, recording_path: String) -> Result<Gene
         path: skill_path.to_string_lossy().to_string(),
         steps_count: skill.steps.len(),
         variables_count: skill.variables.len(),
+        stats: PipelineStatsInfo {
+            local_recovery_count: skill.stats.local_recovery_count,
+            llm_enriched_count: skill.stats.llm_enriched_count,
+            goms_boundaries_count: skill.stats.goms_boundaries_count,
+            context_transitions_count: skill.stats.context_transitions_count,
+            unit_tasks_count: skill.stats.unit_tasks_count,
+            significant_events_count: skill.stats.significant_events_count,
+            trajectory_adjustments_count: skill.stats.trajectory_adjustments_count,
+            variables_count: skill.stats.variables_count,
+            generated_steps_count: skill.stats.generated_steps_count,
+        },
     })
 }
 
@@ -695,6 +727,12 @@ pub struct UiConfig {
     pub min_pause_ms: u64,
     pub model: String,
     pub temperature: f32,
+    pub use_action_clustering: bool,
+    pub use_local_recovery: bool,
+    pub use_vision_ocr: bool,
+    pub use_trajectory_analysis: bool,
+    pub use_goms_detection: bool,
+    pub use_context_tracking: bool,
 }
 
 /// Get current generator configuration
@@ -707,6 +745,12 @@ fn get_config() -> Result<UiConfig, String> {
         min_pause_ms: config.analysis.min_pause_ms,
         model: config.codegen.model,
         temperature: config.codegen.temperature,
+        use_action_clustering: config.pipeline.use_action_clustering,
+        use_local_recovery: config.pipeline.use_local_recovery,
+        use_vision_ocr: config.pipeline.use_vision_ocr,
+        use_trajectory_analysis: config.pipeline.use_trajectory_analysis,
+        use_goms_detection: config.pipeline.use_goms_detection,
+        use_context_tracking: config.pipeline.use_context_tracking,
     })
 }
 
@@ -719,6 +763,12 @@ fn save_config(config: UiConfig) -> Result<(), String> {
     full_config.analysis.min_pause_ms = config.min_pause_ms;
     full_config.codegen.model = config.model;
     full_config.codegen.temperature = config.temperature;
+    full_config.pipeline.use_action_clustering = config.use_action_clustering;
+    full_config.pipeline.use_local_recovery = config.use_local_recovery;
+    full_config.pipeline.use_vision_ocr = config.use_vision_ocr;
+    full_config.pipeline.use_trajectory_analysis = config.use_trajectory_analysis;
+    full_config.pipeline.use_goms_detection = config.use_goms_detection;
+    full_config.pipeline.use_context_tracking = config.use_context_tracking;
     full_config.save_default().map_err(|e| e.to_string())?;
     info!("Configuration saved");
     Ok(())

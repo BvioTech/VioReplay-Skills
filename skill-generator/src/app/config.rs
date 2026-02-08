@@ -13,6 +13,9 @@ pub struct Config {
     pub analysis: AnalysisConfig,
     /// Code generation settings
     pub codegen: CodegenConfig,
+    /// Pipeline feature toggles
+    #[serde(default)]
+    pub pipeline: PipelineConfig,
 }
 
 /// Capture configuration
@@ -46,6 +49,36 @@ pub struct CodegenConfig {
     pub temperature: f32,
     /// Include screenshots in skill
     pub include_screenshots: bool,
+}
+
+/// Pipeline feature toggles
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineConfig {
+    /// Use ActionClusterer to group events into UnitTasks
+    pub use_action_clustering: bool,
+    /// Use NullHandler local recovery (AX retry + spiral search)
+    pub use_local_recovery: bool,
+    /// Enable Vision OCR as part of local recovery pipeline
+    pub use_vision_ocr: bool,
+    /// Use RDP + kinematic analysis for trajectory processing
+    pub use_trajectory_analysis: bool,
+    /// Use GOMS mental operator detection for cognitive boundary analysis
+    pub use_goms_detection: bool,
+    /// Use ContextStack to track window/app context changes
+    pub use_context_tracking: bool,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            use_action_clustering: true,
+            use_local_recovery: true,
+            use_vision_ocr: true,
+            use_trajectory_analysis: true,
+            use_goms_detection: true,
+            use_context_tracking: true,
+        }
+    }
 }
 
 
@@ -213,6 +246,17 @@ mod tests {
     }
 
     #[test]
+    fn test_pipeline_config_defaults() {
+        let pipeline = PipelineConfig::default();
+        assert!(pipeline.use_action_clustering);
+        assert!(pipeline.use_local_recovery);
+        assert!(pipeline.use_vision_ocr);
+        assert!(pipeline.use_trajectory_analysis);
+        assert!(pipeline.use_goms_detection);
+        assert!(pipeline.use_context_tracking);
+    }
+
+    #[test]
     fn test_config_roundtrip_serialization() {
         let original = Config::default();
         let toml_str = original.to_toml().unwrap();
@@ -279,6 +323,7 @@ mod tests {
                 temperature: 0.7,
                 include_screenshots: true,
             },
+            pipeline: PipelineConfig::default(),
         };
 
         let toml_str = config.to_toml().unwrap();

@@ -161,12 +161,25 @@ impl SkillGenerator {
 
     /// Generate a skill from a recording
     pub fn generate(&self, recording: &Recording) -> Result<GeneratedSkill, GeneratorError> {
+        let mut stats = PipelineStats::default();
+
+        // Count events missing semantic data before recovery
+        let missing_before = recording.events.iter()
+            .filter(|e| e.raw.event_type.is_click() && e.semantic.is_none())
+            .count();
+
         // Step 0a: Local recovery for events missing semantic data (fast, no network)
         let locally_recovered = if self.config.use_local_recovery {
             self.enrich_with_local_recovery(recording)
         } else {
             recording.clone()
         };
+
+        // Count how many were recovered locally
+        let missing_after_local = locally_recovered.events.iter()
+            .filter(|e| e.raw.event_type.is_click() && e.semantic.is_none())
+            .count();
+        stats.local_recovery_count = missing_before.saturating_sub(missing_after_local);
 
         // Step 0b: LLM semantic inference for remaining gaps (slower, requires API key)
         let enriched_recording = if self.config.use_llm_semantic {
@@ -175,8 +188,14 @@ impl SkillGenerator {
             locally_recovered
         };
 
+        let missing_after_llm = enriched_recording.events.iter()
+            .filter(|e| e.raw.event_type.is_click() && e.semantic.is_none())
+            .count();
+        stats.llm_enriched_count = missing_after_local.saturating_sub(missing_after_llm);
+
         // Step 1: Extract significant events (clicks, keystrokes)
         let significant_events = self.extract_significant_events(&enriched_recording);
+        stats.significant_events_count = significant_events.len();
 
         if significant_events.is_empty() {
             return Err(GeneratorError::NoSignificantEvents);
@@ -188,6 +207,7 @@ impl SkillGenerator {
             if !boundaries.is_empty() {
                 info!("GOMS detector found {} cognitive boundaries", boundaries.len());
             }
+            stats.goms_boundaries_count = boundaries.len();
             boundaries
         } else {
             Vec::new()
@@ -196,6 +216,9 @@ impl SkillGenerator {
         // Step 1.6: Track window/app context transitions (if enabled)
         if self.config.use_context_tracking {
             self.track_context_transitions(&enriched_recording);
+            stats.context_transitions_count = self.context_stack.lock()
+                .map(|s| s.depth())
+                .unwrap_or(0);
         }
 
         // Step 2: Bind intents to events
@@ -211,6 +234,7 @@ impl SkillGenerator {
                 None
             } else {
                 info!("ActionClusterer produced {} unit tasks from {} significant events", tasks.len(), sig_events.len());
+                stats.unit_tasks_count = tasks.len();
                 Some(tasks)
             }
         } else {
@@ -224,6 +248,7 @@ impl SkillGenerator {
         } else {
             Vec::new()
         };
+        stats.variables_count = variables.len();
 
         // Step 4: Generate steps (from UnitTasks if available, otherwise from raw actions)
         let steps = if let Some(ref tasks) = unit_tasks {
@@ -234,7 +259,11 @@ impl SkillGenerator {
 
         // Step 4.5: Analyze trajectories and adjust confidence (if enabled)
         let steps = if self.config.use_trajectory_analysis {
-            self.adjust_confidence_from_trajectory(steps, &enriched_recording)
+            let adjusted = self.adjust_confidence_from_trajectory(steps, &enriched_recording);
+            stats.trajectory_adjustments_count = adjusted.iter()
+                .filter(|s| s.confidence > 0.7)
+                .count();
+            adjusted
         } else {
             steps
         };
@@ -264,6 +293,8 @@ impl SkillGenerator {
             steps_with_selectors
         };
 
+        stats.generated_steps_count = steps_with_verification.len();
+
         // Step 7: Build the skill
         let skill = GeneratedSkill {
             name: recording.metadata.name.clone(),
@@ -275,6 +306,7 @@ impl SkillGenerator {
             variables: variables.clone(),
             steps: steps_with_verification,
             source_recording_id: recording.metadata.id,
+            stats,
         };
 
         Ok(skill)
@@ -1430,6 +1462,29 @@ impl Default for SkillGenerator {
     }
 }
 
+/// Pipeline execution statistics
+#[derive(Debug, Clone, Default)]
+pub struct PipelineStats {
+    /// Number of events recovered by local recovery (AX retry + spiral search + Vision OCR)
+    pub local_recovery_count: usize,
+    /// Number of events enriched by LLM semantic inference
+    pub llm_enriched_count: usize,
+    /// Number of GOMS cognitive boundaries detected
+    pub goms_boundaries_count: usize,
+    /// Number of context transitions tracked
+    pub context_transitions_count: usize,
+    /// Number of UnitTasks from action clustering
+    pub unit_tasks_count: usize,
+    /// Number of significant events extracted from recording
+    pub significant_events_count: usize,
+    /// Number of trajectory confidence adjustments applied
+    pub trajectory_adjustments_count: usize,
+    /// Number of variables extracted
+    pub variables_count: usize,
+    /// Total generated steps
+    pub generated_steps_count: usize,
+}
+
 /// A generated skill ready for output
 #[derive(Debug, Clone)]
 pub struct GeneratedSkill {
@@ -1447,6 +1502,8 @@ pub struct GeneratedSkill {
     pub steps: Vec<GeneratedStep>,
     /// Source recording ID
     pub source_recording_id: uuid::Uuid,
+    /// Pipeline execution statistics
+    pub stats: PipelineStats,
 }
 
 /// Error type for skill generation
