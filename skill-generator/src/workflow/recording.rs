@@ -1,0 +1,453 @@
+//! Recording Data Structures
+//!
+//! Defines the serialization format for captured event recordings.
+
+use crate::capture::types::{EnrichedEvent, RawEvent, SemanticContext};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use uuid::Uuid;
+
+/// Recording metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingMetadata {
+    /// Unique recording ID
+    pub id: Uuid,
+    /// Recording name
+    pub name: String,
+    /// User-provided goal description
+    pub goal: Option<String>,
+    /// Application context (bundle ID)
+    pub app_context: Option<String>,
+    /// Recording start time
+    pub started_at: DateTime<Utc>,
+    /// Recording end time
+    pub ended_at: Option<DateTime<Utc>>,
+    /// Total event count
+    pub event_count: usize,
+    /// Recording duration in milliseconds
+    pub duration_ms: u64,
+    /// Version of the recording format
+    pub format_version: String,
+}
+
+impl RecordingMetadata {
+    /// Create new metadata for a recording
+    pub fn new(name: String, goal: Option<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name,
+            goal,
+            app_context: None,
+            started_at: Utc::now(),
+            ended_at: None,
+            event_count: 0,
+            duration_ms: 0,
+            format_version: "1.0".to_string(),
+        }
+    }
+
+    /// Finalize the recording with end time and event count
+    pub fn finalize(&mut self, event_count: usize, duration_ms: u64) {
+        self.ended_at = Some(Utc::now());
+        self.event_count = event_count;
+        self.duration_ms = duration_ms;
+    }
+}
+
+/// A complete recording of user interactions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Recording {
+    /// Recording metadata
+    pub metadata: RecordingMetadata,
+    /// Enriched events with semantic data
+    pub events: Vec<EnrichedEvent>,
+}
+
+impl Recording {
+    /// Create a new empty recording
+    pub fn new(name: String, goal: Option<String>) -> Self {
+        Self {
+            metadata: RecordingMetadata::new(name, goal),
+            events: Vec::new(),
+        }
+    }
+
+    /// Add an event to the recording
+    pub fn add_event(&mut self, event: EnrichedEvent) {
+        self.events.push(event);
+    }
+
+    /// Add a raw event (will be converted to enriched)
+    pub fn add_raw_event(&mut self, raw: RawEvent) {
+        let sequence = self.events.len() as u64;
+        let enriched = EnrichedEvent::new(raw, sequence);
+        self.events.push(enriched);
+    }
+
+    /// Add a raw event with semantic context
+    pub fn add_enriched_raw(&mut self, raw: RawEvent, semantic: Option<SemanticContext>) {
+        let sequence = self.events.len() as u64;
+        let mut enriched = EnrichedEvent::new(raw, sequence);
+        enriched.semantic = semantic;
+        self.events.push(enriched);
+    }
+
+    /// Finalize the recording
+    pub fn finalize(&mut self, duration_ms: u64) {
+        self.metadata.finalize(self.events.len(), duration_ms);
+    }
+
+    /// Save recording to a file
+    pub fn save(&self, path: &Path) -> crate::Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Load recording from a file
+    pub fn load(path: &Path) -> crate::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let recording: Recording = serde_json::from_str(&content)?;
+        Ok(recording)
+    }
+
+    /// Get the number of events
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Check if recording is empty
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Get events by type filter
+    pub fn events_of_type(
+        &self,
+        filter: impl Fn(&EnrichedEvent) -> bool,
+    ) -> Vec<&EnrichedEvent> {
+        self.events.iter().filter(|e| filter(e)).collect()
+    }
+
+    /// Get click events only
+    pub fn click_events(&self) -> Vec<&EnrichedEvent> {
+        self.events_of_type(|e| e.raw.event_type.is_click())
+    }
+
+    /// Get keyboard events only
+    pub fn keyboard_events(&self) -> Vec<&EnrichedEvent> {
+        self.events_of_type(|e| e.raw.event_type.is_keyboard())
+    }
+}
+
+impl Default for Recording {
+    fn default() -> Self {
+        Self::new("untitled".to_string(), None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::types::{CursorState, EventType, ModifierFlags};
+    use crate::time::timebase::{MachTimebase, Timestamp};
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn make_test_raw_event(event_type: EventType, x: f64, y: f64) -> RawEvent {
+        MachTimebase::init();
+        RawEvent {
+            timestamp: Timestamp::now(),
+            event_type,
+            coordinates: (x, y),
+            cursor_state: CursorState::Arrow,
+            key_code: None,
+            character: None,
+            modifiers: ModifierFlags::default(),
+            scroll_delta: None,
+            click_count: 0,
+        }
+    }
+
+    fn make_test_raw_event_with_keyboard(key_code: u16, character: char) -> RawEvent {
+        MachTimebase::init();
+        RawEvent {
+            timestamp: Timestamp::now(),
+            event_type: EventType::KeyDown,
+            coordinates: (0.0, 0.0),
+            cursor_state: CursorState::Arrow,
+            key_code: Some(key_code),
+            character: Some(character),
+            modifiers: ModifierFlags::default(),
+            scroll_delta: None,
+            click_count: 0,
+        }
+    }
+
+    #[test]
+    fn test_recording_creation() {
+        let recording = Recording::new("test".to_string(), Some("Test goal".to_string()));
+        assert_eq!(recording.metadata.name, "test");
+        assert_eq!(recording.metadata.goal, Some("Test goal".to_string()));
+        assert!(recording.is_empty());
+    }
+
+    #[test]
+    fn test_add_events() {
+        MachTimebase::init();
+        let mut recording = Recording::new("test".to_string(), None);
+
+        for i in 0..5 {
+            let raw = make_test_raw_event(EventType::MouseMoved, i as f64, 0.0);
+            recording.add_raw_event(raw);
+        }
+
+        assert_eq!(recording.len(), 5);
+
+        // Add click event
+        let click = make_test_raw_event(EventType::LeftMouseDown, 100.0, 100.0);
+        recording.add_raw_event(click);
+
+        assert_eq!(recording.click_events().len(), 1);
+    }
+
+    #[test]
+    fn test_finalize() {
+        let mut recording = Recording::new("test".to_string(), None);
+        recording.finalize(1000);
+
+        assert!(recording.metadata.ended_at.is_some());
+        assert_eq!(recording.metadata.duration_ms, 1000);
+    }
+
+    #[test]
+    fn test_serialization() {
+        MachTimebase::init();
+        let mut recording = Recording::new("test".to_string(), Some("Goal".to_string()));
+
+        let raw = make_test_raw_event(EventType::LeftMouseDown, 100.0, 200.0);
+        recording.add_raw_event(raw);
+        recording.finalize(500);
+
+        let json = serde_json::to_string(&recording).unwrap();
+        let loaded: Recording = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.metadata.name, "test");
+        assert_eq!(loaded.len(), 1);
+    }
+
+    #[test]
+    fn test_recording_metadata_creation() {
+        let metadata = RecordingMetadata::new("test_recording".to_string(), Some("Test goal".to_string()));
+        assert_eq!(metadata.name, "test_recording");
+        assert_eq!(metadata.goal, Some("Test goal".to_string()));
+        assert!(metadata.ended_at.is_none());
+        assert_eq!(metadata.event_count, 0);
+        assert_eq!(metadata.duration_ms, 0);
+        assert_eq!(metadata.format_version, "1.0");
+    }
+
+    #[test]
+    fn test_recording_metadata_finalize() {
+        let mut metadata = RecordingMetadata::new("test".to_string(), None);
+        assert!(metadata.ended_at.is_none());
+
+        metadata.finalize(42, 5000);
+
+        assert!(metadata.ended_at.is_some());
+        assert_eq!(metadata.event_count, 42);
+        assert_eq!(metadata.duration_ms, 5000);
+    }
+
+    #[test]
+    fn test_add_enriched_raw_event() {
+        MachTimebase::init();
+        let mut recording = Recording::new("test".to_string(), None);
+
+        let raw = make_test_raw_event(EventType::LeftMouseDown, 100.0, 200.0);
+        let semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".to_string()),
+            title: Some("Click Me".to_string()),
+            ..Default::default()
+        });
+
+        recording.add_enriched_raw(raw, semantic.clone());
+
+        assert_eq!(recording.len(), 1);
+        assert!(recording.events[0].semantic.is_some());
+        assert_eq!(
+            recording.events[0].semantic.as_ref().unwrap().title,
+            semantic.unwrap().title
+        );
+    }
+
+    #[test]
+    fn test_events_of_type_filter() {
+        MachTimebase::init();
+        let mut recording = Recording::new("test".to_string(), None);
+
+        recording.add_raw_event(make_test_raw_event(EventType::MouseMoved, 10.0, 10.0));
+        recording.add_raw_event(make_test_raw_event(EventType::LeftMouseDown, 20.0, 20.0));
+        recording.add_raw_event(make_test_raw_event(EventType::RightMouseDown, 30.0, 30.0));
+        recording.add_raw_event(make_test_raw_event(EventType::KeyDown, 0.0, 0.0));
+
+        let clicks = recording.events_of_type(|e| e.raw.event_type.is_click());
+        assert_eq!(clicks.len(), 2);
+
+        let mouse_moves = recording.events_of_type(|e| e.raw.event_type.is_mouse_move());
+        assert_eq!(mouse_moves.len(), 1);
+    }
+
+    #[test]
+    fn test_click_events_filter() {
+        MachTimebase::init();
+        let mut recording = Recording::new("test".to_string(), None);
+
+        recording.add_raw_event(make_test_raw_event(EventType::LeftMouseDown, 10.0, 10.0));
+        recording.add_raw_event(make_test_raw_event(EventType::LeftMouseUp, 10.0, 10.0));
+        recording.add_raw_event(make_test_raw_event(EventType::MouseMoved, 20.0, 20.0));
+        recording.add_raw_event(make_test_raw_event(EventType::RightMouseDown, 30.0, 30.0));
+        recording.add_raw_event(make_test_raw_event(EventType::KeyDown, 0.0, 0.0));
+
+        let clicks = recording.click_events();
+        assert_eq!(clicks.len(), 3); // left down, left up, right down
+    }
+
+    #[test]
+    fn test_keyboard_events_filter() {
+        MachTimebase::init();
+        let mut recording = Recording::new("test".to_string(), None);
+
+        recording.add_raw_event(make_test_raw_event_with_keyboard(0, 'a'));
+        recording.add_raw_event(make_test_raw_event_with_keyboard(1, 'b'));
+        recording.add_raw_event(make_test_raw_event(EventType::LeftMouseDown, 10.0, 10.0));
+        recording.add_raw_event(make_test_raw_event_with_keyboard(2, 'c'));
+
+        let keyboard_events = recording.keyboard_events();
+        assert_eq!(keyboard_events.len(), 3);
+    }
+
+    #[test]
+    fn test_save_and_load_recording() {
+        MachTimebase::init();
+        let mut recording = Recording::new("save_test".to_string(), Some("Test save/load".to_string()));
+
+        recording.add_raw_event(make_test_raw_event(EventType::LeftMouseDown, 100.0, 200.0));
+        recording.add_raw_event(make_test_raw_event_with_keyboard(0, 'x'));
+        recording.finalize(1500);
+
+        // Create a temporary file
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+
+        // Save recording
+        recording.save(path).unwrap();
+
+        // Load recording
+        let loaded = Recording::load(path).unwrap();
+
+        assert_eq!(loaded.metadata.name, "save_test");
+        assert_eq!(loaded.metadata.goal, Some("Test save/load".to_string()));
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.metadata.duration_ms, 1500);
+        assert!(loaded.metadata.ended_at.is_some());
+    }
+
+    #[test]
+    fn test_recording_default() {
+        let recording = Recording::default();
+        assert_eq!(recording.metadata.name, "untitled");
+        assert!(recording.metadata.goal.is_none());
+        assert!(recording.is_empty());
+    }
+
+    #[test]
+    fn test_load_invalid_file() {
+        let result = Recording::load(Path::new("/nonexistent/file.json"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_malformed_json() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"{ invalid json }").unwrap();
+        temp_file.flush().unwrap();
+
+        let result = Recording::load(temp_file.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sequential_event_ordering() {
+        MachTimebase::init();
+        let mut recording = Recording::new("sequence_test".to_string(), None);
+
+        // Add events in order
+        recording.add_raw_event(make_test_raw_event(EventType::LeftMouseDown, 10.0, 10.0));
+        recording.add_raw_event(make_test_raw_event(EventType::LeftMouseUp, 10.0, 10.0));
+        recording.add_raw_event(make_test_raw_event(EventType::KeyDown, 0.0, 0.0));
+
+        // Verify sequence numbers
+        assert_eq!(recording.events[0].sequence, 0);
+        assert_eq!(recording.events[1].sequence, 1);
+        assert_eq!(recording.events[2].sequence, 2);
+    }
+
+    #[test]
+    fn test_finalize_updates_metadata() {
+        MachTimebase::init();
+        let mut recording = Recording::new("finalize_test".to_string(), None);
+
+        recording.add_raw_event(make_test_raw_event(EventType::LeftMouseDown, 10.0, 10.0));
+        recording.add_raw_event(make_test_raw_event(EventType::LeftMouseUp, 10.0, 10.0));
+
+        assert_eq!(recording.metadata.event_count, 0);
+        assert_eq!(recording.metadata.duration_ms, 0);
+
+        recording.finalize(2500);
+
+        assert_eq!(recording.metadata.event_count, 2);
+        assert_eq!(recording.metadata.duration_ms, 2500);
+    }
+
+    #[test]
+    fn test_empty_recording_operations() {
+        let recording = Recording::new("empty".to_string(), None);
+
+        assert_eq!(recording.len(), 0);
+        assert!(recording.is_empty());
+        assert_eq!(recording.click_events().len(), 0);
+        assert_eq!(recording.keyboard_events().len(), 0);
+        assert_eq!(recording.events_of_type(|_| true).len(), 0);
+    }
+
+    #[test]
+    fn test_recording_with_large_event_set() {
+        MachTimebase::init();
+        let mut recording = Recording::new("large_test".to_string(), None);
+
+        // Add 1000 events
+        for i in 0..1000 {
+            let event_type = if i % 3 == 0 {
+                EventType::LeftMouseDown
+            } else if i % 3 == 1 {
+                EventType::KeyDown
+            } else {
+                EventType::MouseMoved
+            };
+            recording.add_raw_event(make_test_raw_event(event_type, i as f64, i as f64));
+        }
+
+        assert_eq!(recording.len(), 1000);
+        assert!(!recording.is_empty());
+
+        // Verify filtering works correctly
+        let clicks = recording.click_events();
+        let keyboard = recording.keyboard_events();
+
+        // Approximately 333 of each type
+        assert!(clicks.len() >= 330 && clicks.len() <= 340);
+        assert!(keyboard.len() >= 330 && keyboard.len() <= 340);
+    }
+}

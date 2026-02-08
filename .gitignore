@@ -1,0 +1,27 @@
+# Build artifacts
+target/
+dist/
+node_modules/
+
+# Secrets
+.env
+.env.*
+*.key
+*.pem
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Claude Code session state
+.claude/
+*/.claude/

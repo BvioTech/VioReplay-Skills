@@ -1,0 +1,88 @@
+[package]
+name = "skill_generator"
+version = "0.1.0"
+edition = "2021"
+authors = ["Aezi <aezi.zhu@icloud.com>"]
+description = "Production-grade macOS Skill Generation Engine - transforms user interaction telemetry into Claude Code SKILL.md artifacts"
+license = "MIT"
+
+[dependencies]
+# Lock-free ring buffer
+rtrb = "0.3"
+
+# macOS system bindings
+core-graphics = "0.24"
+core-foundation = "0.10"
+cocoa = "0.26"
+objc = "0.2"
+objc-foundation = "0.1"
+block = "0.1"
+
+# Low-level mach bindings for precise timing
+mach2 = "0.4"
+
+# Concurrency primitives
+crossbeam = "0.8"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# UUID generation
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Time handling (for output formatting only)
+chrono = { version = "0.4", features = ["serde"] }
+
+# Configuration
+toml = "0.8"
+directories = "5"
+dirs = "5"
+
+# Regex for validation
+regex = "1"
+
+# Signal handling
+ctrlc = "3"
+
+# HTTP client for Claude API
+reqwest = { version = "0.12", features = ["json"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
+tempfile = "3"
+
+# [[bench]]
+# name = "event_capture"
+# harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[lints.rust]
+# Suppress warnings from objc crate's msg_send! macro
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

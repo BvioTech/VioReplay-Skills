@@ -1,0 +1,706 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import "./App.css";
+
+interface RecordingStatus {
+  is_recording: boolean;
+  event_count: number;
+  duration_seconds: number;
+  has_accessibility: boolean;
+  has_screen_recording: boolean;
+}
+
+interface RecordingInfo {
+  name: string;
+  path: string;
+  event_count: number;
+  duration_ms: number;
+  created_at: string;
+  goal: string | null;
+}
+
+interface GeneratedSkillInfo {
+  name: string;
+  path: string;
+  steps_count: number;
+  variables_count: number;
+}
+
+interface UiConfig {
+  rdp_epsilon_px: number;
+  hesitation_threshold: number;
+  min_pause_ms: number;
+  model: string;
+  temperature: number;
+}
+
+type Tab = "record" | "recordings" | "settings";
+
+function App() {
+  // Recording state
+  const [isRecording, setIsRecording] = useState(false);
+  const [eventCount, setEventCount] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [hasAccessibility, setHasAccessibility] = useState(false);
+  const [hasScreenRecording, setHasScreenRecording] = useState(false);
+  const [eventsPerSecond, setEventsPerSecond] = useState(0);
+  const lastEventCountRef = useRef(0);
+
+  // Input state
+  const [recordingName, setRecordingName] = useState("");
+  const [goal, setGoal] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [maskedApiKey, setMaskedApiKey] = useState<string | null>(null);
+
+  // Recordings list
+  const [recordings, setRecordings] = useState<RecordingInfo[]>([]);
+
+  // UI state
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<Tab>("record");
+  const [generating, setGenerating] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+
+  // Skill preview state
+  const [previewContent, setPreviewContent] = useState<string | null>(null);
+  const [previewName, setPreviewName] = useState<string | null>(null);
+
+  // Track generated skills by recording path -> skill path
+  const [generatedSkills, setGeneratedSkills] = useState<Record<string, string>>({});
+
+  // Config state
+  const [config, setConfig] = useState<UiConfig | null>(null);
+
+  // Timer ref
+  const timerRef = useRef<number | null>(null);
+
+  // Check permissions and load recordings on mount
+  useEffect(() => {
+    checkStatus();
+    loadRecordings();
+    loadApiKey();
+    loadConfig();
+  }, []);
+
+  // Auto-dismiss notifications after 5 seconds
+  useEffect(() => {
+    if (success) {
+      const timer = setTimeout(() => setSuccess(null), 5000);
+      return () => clearTimeout(timer);
+    }
+  }, [success]);
+
+  useEffect(() => {
+    if (error) {
+      const timer = setTimeout(() => setError(null), 8000);
+      return () => clearTimeout(timer);
+    }
+  }, [error]);
+
+  // Poll status while recording
+  useEffect(() => {
+    if (isRecording) {
+      timerRef.current = window.setInterval(() => {
+        checkStatus();
+      }, 500);
+    } else {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    }
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [isRecording]);
+
+  // Calculate events per second
+  useEffect(() => {
+    if (isRecording) {
+      const rate = (eventCount - lastEventCountRef.current) * 2; // x2 because poll is 500ms
+      setEventsPerSecond(Math.max(0, rate));
+      lastEventCountRef.current = eventCount;
+    } else {
+      setEventsPerSecond(0);
+      lastEventCountRef.current = 0;
+    }
+  }, [eventCount, isRecording]);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.metaKey && e.key === "r" && !isRecording && hasAccessibility) {
+        e.preventDefault();
+        handleStartRecording();
+      }
+      if (e.key === "Escape" && isRecording) {
+        e.preventDefault();
+        handleStopRecording();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isRecording, hasAccessibility, recordingName, goal]);
+
+  async function checkStatus() {
+    try {
+      const status = await invoke<RecordingStatus>("get_recording_status");
+      setIsRecording(status.is_recording);
+      setEventCount(status.event_count);
+      setDuration(status.duration_seconds);
+      setHasAccessibility(status.has_accessibility);
+      setHasScreenRecording(status.has_screen_recording);
+    } catch (e) {
+      console.error("Failed to get status:", e);
+    }
+  }
+
+  async function loadRecordings() {
+    try {
+      const list = await invoke<RecordingInfo[]>("list_recordings");
+      setRecordings(list);
+    } catch (e) {
+      console.error("Failed to load recordings:", e);
+      setError("Failed to load recordings");
+    }
+  }
+
+  async function loadApiKey() {
+    try {
+      const key = await invoke<string | null>("get_api_key");
+      setMaskedApiKey(key);
+    } catch (e) {
+      console.error("Failed to load API key:", e);
+    }
+  }
+
+  async function loadConfig() {
+    try {
+      const cfg = await invoke<UiConfig>("get_config");
+      setConfig(cfg);
+    } catch (e) {
+      console.error("Failed to load config:", e);
+    }
+  }
+
+  const handleStartRecording = useCallback(async () => {
+    setError(null);
+    setSuccess(null);
+    try {
+      await invoke("start_recording", {
+        name: recordingName || "",
+        goal: goal || null
+      });
+      setIsRecording(true);
+      setEventCount(0);
+      setDuration(0);
+    } catch (e: unknown) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      setError(errorMsg);
+    }
+  }, [recordingName, goal]);
+
+  const handleStopRecording = useCallback(async () => {
+    setError(null);
+    try {
+      const info = await invoke<RecordingInfo>("stop_recording");
+      setIsRecording(false);
+      setSuccess(`Recording saved: ${info.name} (${info.event_count} events)`);
+      setRecordingName("");
+      setGoal("");
+      loadRecordings();
+      setActiveTab("recordings");
+    } catch (e: unknown) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      setError(errorMsg);
+    }
+  }, []);
+
+  async function handleGenerateSkill(recordingPath: string) {
+    setError(null);
+    setSuccess(null);
+    setPreviewContent(null);
+    setPreviewName(null);
+    setGenerating(recordingPath);
+    try {
+      const skill = await invoke<GeneratedSkillInfo>("generate_skill", {
+        recordingPath
+      });
+      setSuccess(`SKILL.md generated: ${skill.name} (${skill.steps_count} steps, ${skill.variables_count} variables)`);
+      setGeneratedSkills(prev => ({ ...prev, [recordingPath]: skill.path }));
+
+      // Load preview
+      try {
+        const content = await invoke<string>("read_skill_file", { path: skill.path });
+        setPreviewContent(content);
+        setPreviewName(skill.name);
+      } catch {
+        // Preview is optional
+      }
+    } catch (e: unknown) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      setError(errorMsg);
+    } finally {
+      setGenerating(null);
+    }
+  }
+
+  async function handleSaveApiKey() {
+    setError(null);
+    try {
+      await invoke("set_api_key", { key: apiKey });
+      setSuccess("API Key saved");
+      setApiKey("");
+      loadApiKey();
+    } catch (e: unknown) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      setError(errorMsg);
+    }
+  }
+
+  async function handleSaveConfig() {
+    if (!config) return;
+    setError(null);
+    try {
+      await invoke("save_config", { config });
+      setSuccess("Configuration saved");
+    } catch (e: unknown) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      setError(errorMsg);
+    }
+  }
+
+  async function handleOpenInFinder(path: string) {
+    try {
+      await invoke("open_in_finder", { path });
+    } catch (e) {
+      console.error("Failed to open in Finder:", e);
+      setError("Failed to open in Finder");
+    }
+  }
+
+  function handleDeleteRecording(name: string) {
+    if (confirmDelete === name) {
+      performDelete(name);
+    } else {
+      setConfirmDelete(name);
+    }
+  }
+
+  async function performDelete(name: string) {
+    setError(null);
+    setSuccess(null);
+    setConfirmDelete(null);
+    try {
+      await invoke("delete_recording", { name });
+      setRecordings((prev) => prev.filter((r) => r.name !== name));
+      setSuccess(`Deleted recording: ${name}`);
+    } catch (e: unknown) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      setError(`Failed to delete: ${errorMsg}`);
+      await loadRecordings();
+    }
+  }
+
+  async function handleDownloadSkill(path: string, name: string) {
+    try {
+      const content = await invoke<string>("read_skill_file", { path });
+      const blob = new Blob([content], { type: "text/markdown" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${name}-SKILL.md`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      setError("Failed to download skill file");
+    }
+  }
+
+  function formatDuration(seconds: number): string {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${secs.toString().padStart(2, "0")}`;
+  }
+
+  function formatDurationMs(ms: number): string {
+    if (ms < 1000) return "< 1s";
+    const secs = Math.round(ms / 1000);
+    if (secs < 60) return `${secs}s`;
+    const mins = Math.floor(secs / 60);
+    const remainder = secs % 60;
+    return `${mins}m ${remainder}s`;
+  }
+
+  function formatDate(isoString: string): string {
+    return new Date(isoString).toLocaleString("en-US", {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  }
+
+  return (
+    <main className="app">
+      {/* Status Bar */}
+      <header className="status-bar">
+        <div className="status-badges">
+          <span className={`badge ${hasAccessibility ? "badge-ok" : "badge-error"}`}>
+            {hasAccessibility ? "Accessibility" : "No Accessibility"}
+          </span>
+          <span className={`badge ${hasScreenRecording ? "badge-ok" : "badge-warn"}`}>
+            {hasScreenRecording ? "Screen Recording" : "No Screen Rec"}
+          </span>
+          <span className={`badge ${maskedApiKey ? "badge-ok" : "badge-warn"}`}>
+            {maskedApiKey ? `API: ${maskedApiKey}` : "No API Key"}
+          </span>
+        </div>
+      </header>
+
+      {/* Navigation Tabs */}
+      <nav className="tab-bar">
+        <button
+          className={`tab ${activeTab === "record" ? "tab-active" : ""}`}
+          onClick={() => setActiveTab("record")}
+        >
+          Record
+        </button>
+        <button
+          className={`tab ${activeTab === "recordings" ? "tab-active" : ""}`}
+          onClick={() => setActiveTab("recordings")}
+        >
+          Recordings{recordings.length > 0 ? ` (${recordings.length})` : ""}
+        </button>
+        <button
+          className={`tab ${activeTab === "settings" ? "tab-active" : ""}`}
+          onClick={() => setActiveTab("settings")}
+        >
+          Settings
+        </button>
+      </nav>
+
+      {/* Alerts */}
+      <div className="alerts" aria-live="polite">
+        {error && (
+          <div className="alert error" role="alert" onClick={() => setError(null)}>
+            {error}
+          </div>
+        )}
+        {success && (
+          <div className="alert success" role="status" onClick={() => setSuccess(null)}>
+            {success}
+          </div>
+        )}
+      </div>
+
+      {/* Record Tab */}
+      {activeTab === "record" && (
+        <div className="tab-content">
+          {/* Permission Warnings */}
+          {!hasAccessibility && (
+            <div className="alert warning">
+              Accessibility permission required. Enable in System Settings &gt; Privacy &amp; Security &gt; Accessibility.
+            </div>
+          )}
+
+          <section className="panel recording-panel">
+            {isRecording ? (
+              <>
+                <div className="recording-header">
+                  <span className="recording-indicator">
+                    <span className="recording-dot" aria-hidden="true" />
+                    Recording
+                  </span>
+                  <span className="recording-rate">{eventsPerSecond} evt/s</span>
+                </div>
+
+                <div className="recording-stats">
+                  <div className="stat stat-large">
+                    <span className="stat-value">{formatDuration(duration)}</span>
+                    <span className="stat-label">Duration</span>
+                  </div>
+                  <div className="stat stat-large">
+                    <span className="stat-value">{eventCount.toLocaleString()}</span>
+                    <span className="stat-label">Events</span>
+                  </div>
+                </div>
+
+                <button className="btn btn-stop btn-full" onClick={handleStopRecording}>
+                  Stop Recording
+                  <span className="shortcut-hint">ESC</span>
+                </button>
+              </>
+            ) : (
+              <>
+                <h2 className="panel-title">New Recording</h2>
+                <div className="recording-form">
+                  <input
+                    type="text"
+                    placeholder="Recording name (auto-generated if empty)"
+                    value={recordingName}
+                    onChange={(e) => setRecordingName(e.target.value)}
+                  />
+                  <textarea
+                    placeholder="Describe the task you want to demonstrate..."
+                    value={goal}
+                    onChange={(e) => setGoal(e.target.value)}
+                    rows={3}
+                  />
+                  <button
+                    className="btn btn-start btn-full"
+                    onClick={handleStartRecording}
+                    disabled={!hasAccessibility}
+                  >
+                    Start Recording
+                    <span className="shortcut-hint">Cmd+R</span>
+                  </button>
+                </div>
+              </>
+            )}
+          </section>
+        </div>
+      )}
+
+      {/* Recordings Tab */}
+      {activeTab === "recordings" && (
+        <div className="tab-content">
+          {/* Skill Preview */}
+          {previewContent && (
+            <section className="panel preview-panel">
+              <div className="preview-header">
+                <h2 className="panel-title">Generated: {previewName}</h2>
+                <div className="preview-actions">
+                  <button
+                    className="btn btn-small"
+                    onClick={() => navigator.clipboard.writeText(previewContent).then(() => setSuccess("Copied to clipboard"))}
+                  >
+                    Copy
+                  </button>
+                  {previewName && (
+                    <button
+                      className="btn btn-small"
+                      onClick={() => {
+                        const skillPath = Object.values(generatedSkills).find(p => p.includes(previewName!));
+                        if (skillPath) handleDownloadSkill(skillPath, previewName!);
+                      }}
+                    >
+                      Download
+                    </button>
+                  )}
+                  <button
+                    className="btn btn-small"
+                    onClick={() => { setPreviewContent(null); setPreviewName(null); }}
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+              <pre className="skill-preview">{previewContent}</pre>
+            </section>
+          )}
+
+          {/* Recordings List */}
+          <section className="panel">
+            <h2 className="panel-title">
+              Recordings
+              <button className="btn btn-tiny" onClick={() => loadRecordings()} title="Refresh">
+                Refresh
+              </button>
+            </h2>
+            {recordings.length === 0 ? (
+              <div className="empty-state">
+                <p>No recordings yet</p>
+                <p className="empty-hint">
+                  Go to the Record tab to create your first recording
+                </p>
+              </div>
+            ) : (
+              <ul className="recordings-list">
+                {recordings.map((rec) => (
+                  <li key={rec.path} className="recording-item">
+                    <div className="recording-info">
+                      <div className="recording-name-row">
+                        <strong>{rec.name}</strong>
+                        <span className="recording-date">{formatDate(rec.created_at)}</span>
+                      </div>
+                      <div className="recording-meta">
+                        <span className="meta-tag">{rec.event_count.toLocaleString()} events</span>
+                        <span className="meta-tag">{formatDurationMs(rec.duration_ms)}</span>
+                      </div>
+                      {rec.goal && <p className="recording-goal">{rec.goal}</p>}
+                    </div>
+                    <div className="recording-actions">
+                      <button
+                        className="btn btn-generate"
+                        onClick={() => handleGenerateSkill(rec.path)}
+                        disabled={generating === rec.path}
+                      >
+                        {generating === rec.path ? "Generating..." : "Generate"}
+                      </button>
+                      {generatedSkills[rec.path] && (
+                        <>
+                          <button
+                            className="btn btn-small"
+                            onClick={async () => {
+                              try {
+                                const content = await invoke<string>("read_skill_file", { path: generatedSkills[rec.path] });
+                                setPreviewContent(content);
+                                setPreviewName(rec.name);
+                              } catch {
+                                setError("Failed to load skill preview");
+                              }
+                            }}
+                            title="Preview SKILL.md"
+                          >
+                            Preview
+                          </button>
+                          <button
+                            className="btn btn-small"
+                            onClick={async () => {
+                              try {
+                                const content = await invoke<string>("read_skill_file", { path: generatedSkills[rec.path] });
+                                await navigator.clipboard.writeText(content);
+                                setSuccess("SKILL.md copied to clipboard");
+                              } catch {
+                                setError("Failed to copy skill");
+                              }
+                            }}
+                            title="Copy SKILL.md"
+                          >
+                            Copy
+                          </button>
+                        </>
+                      )}
+                      <button
+                        className="btn btn-small"
+                        onClick={() => handleOpenInFinder(rec.path)}
+                        title="Reveal in Finder"
+                      >
+                        Finder
+                      </button>
+                      <button
+                        className={`btn btn-small btn-danger${confirmDelete === rec.name ? " confirming" : ""}`}
+                        onClick={() => handleDeleteRecording(rec.name)}
+                        onBlur={() => setConfirmDelete(null)}
+                      >
+                        {confirmDelete === rec.name ? "Confirm?" : "Delete"}
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </div>
+      )}
+
+      {/* Settings Tab */}
+      {activeTab === "settings" && (
+        <div className="tab-content">
+          {/* API Key Section */}
+          <section className="panel">
+            <h2 className="panel-title">Anthropic API Key</h2>
+            {maskedApiKey && (
+              <p className="current-key">Current: <code>{maskedApiKey}</code></p>
+            )}
+            <div className="input-row">
+              <input
+                type="password"
+                placeholder="sk-ant-..."
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && apiKey) handleSaveApiKey(); }}
+              />
+              <button className="btn btn-primary" onClick={handleSaveApiKey} disabled={!apiKey}>
+                Save
+              </button>
+            </div>
+            <p className="help-text">Required for AI-powered skill naming and variable inference.</p>
+          </section>
+
+          {/* Generator Config */}
+          {config && (
+            <section className="panel">
+              <h2 className="panel-title">Generator Configuration</h2>
+              <div className="config-form">
+                <label>
+                  <span className="config-label">Trajectory Simplification (RDP epsilon, px)</span>
+                  <input
+                    type="number"
+                    step="0.5"
+                    min="0.5"
+                    max="20"
+                    value={config.rdp_epsilon_px}
+                    onChange={(e) => { const v = parseFloat(e.target.value); if (!Number.isNaN(v)) setConfig({ ...config, rdp_epsilon_px: v }); }}
+                  />
+                </label>
+                <label>
+                  <span className="config-label">Hesitation Threshold (0-1)</span>
+                  <input
+                    type="number"
+                    step="0.05"
+                    min="0"
+                    max="1"
+                    value={config.hesitation_threshold}
+                    onChange={(e) => { const v = parseFloat(e.target.value); if (!Number.isNaN(v)) setConfig({ ...config, hesitation_threshold: v }); }}
+                  />
+                </label>
+                <label>
+                  <span className="config-label">Min Pause for Chunk Boundary (ms)</span>
+                  <input
+                    type="number"
+                    step="50"
+                    min="100"
+                    max="2000"
+                    value={config.min_pause_ms}
+                    onChange={(e) => { const v = parseInt(e.target.value); if (!Number.isNaN(v)) setConfig({ ...config, min_pause_ms: v }); }}
+                  />
+                </label>
+                <label>
+                  <span className="config-label">LLM Model</span>
+                  <input
+                    type="text"
+                    value={config.model}
+                    onChange={(e) => setConfig({ ...config, model: e.target.value })}
+                  />
+                </label>
+                <label>
+                  <span className="config-label">Temperature (0-2)</span>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0"
+                    max="2"
+                    value={config.temperature}
+                    onChange={(e) => { const v = parseFloat(e.target.value); if (!Number.isNaN(v)) setConfig({ ...config, temperature: v }); }}
+                  />
+                </label>
+                <button className="btn btn-primary" onClick={handleSaveConfig}>
+                  Save Configuration
+                </button>
+              </div>
+            </section>
+          )}
+
+          {/* About */}
+          <section className="panel panel-muted">
+            <h2 className="panel-title">About</h2>
+            <p className="about-text">
+              Skill Generator records macOS user interactions and generates Claude Code SKILL.md files.
+              Uses GOMS cognitive model for action chunking, Fitts' Law for kinematic analysis,
+              and Hoare triple verification for deterministic postconditions.
+            </p>
+            <div className="about-meta">
+              <span>v0.1.0</span>
+              <span>584 tests passing</span>
+            </div>
+          </section>
+        </div>
+      )}
+    </main>
+  );
+}
+
+export default App;
