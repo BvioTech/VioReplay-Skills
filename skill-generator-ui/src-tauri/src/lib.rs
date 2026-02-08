@@ -83,6 +83,7 @@ pub struct PipelineStatsInfo {
     pub trajectory_adjustments_count: usize,
     pub variables_count: usize,
     pub generated_steps_count: usize,
+    pub warnings: Vec<String>,
 }
 
 /// Generated skill info
@@ -418,6 +419,7 @@ Requirements for name:
     rt.block_on(async {
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(API_TIMEOUT_SECS))
+            .pool_max_idle_per_host(2)
             .build()
         {
             Ok(c) => c,
@@ -426,32 +428,64 @@ Requirements for name:
                 return None;
             }
         };
-        let response = match client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&serde_json::json!({
-                "model": model,
-                "max_tokens": INFERENCE_MAX_TOKENS,
-                "messages": [{"role": "user", "content": prompt}]
-            }))
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!(error = %e, "AI inference HTTP request failed");
+
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": INFERENCE_MAX_TOKENS,
+            "messages": [{"role": "user", "content": prompt}]
+        });
+
+        let mut response = None;
+        let max_retries = 3u32;
+        for attempt in 0..max_retries {
+            let result = client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        response = Some(resp);
+                        break;
+                    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        let delay = std::time::Duration::from_secs(2u64.pow(attempt + 1));
+                        warn!("Rate limited (429), retrying in {:?}", delay);
+                        tokio::time::sleep(delay).await;
+                    } else if status.is_server_error() {
+                        let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                        warn!("Server error ({}), retrying in {:?}", status, delay);
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        let error_body = resp.text().await.unwrap_or_else(|e| format!("<failed to read body: {}>", e));
+                        error!(status = %status, body = error_body, "AI inference API error");
+                        return None;
+                    }
+                }
+                Err(e) if e.is_timeout() || e.is_connect() => {
+                    let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                    warn!(error = %e, "Network error, retrying in {:?}", delay);
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    error!(error = %e, "AI inference HTTP request failed");
+                    return None;
+                }
+            }
+        }
+
+        let response = match response {
+            Some(r) => r,
+            None => {
+                error!("AI inference failed after {} retries", max_retries);
                 return None;
             }
         };
-
-        let status = response.status();
-        if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_else(|e| format!("<failed to read body: {}>", e));
-            error!(status = %status, body = error_body, "AI inference API error");
-            return None;
-        }
 
         #[derive(serde::Deserialize)]
         struct ApiResponse {
@@ -650,6 +684,7 @@ fn generate_skill(state: State<AppState>, recording_path: String) -> Result<Gene
             trajectory_adjustments_count: skill.stats.trajectory_adjustments_count,
             variables_count: skill.stats.variables_count,
             generated_steps_count: skill.stats.generated_steps_count,
+            warnings: skill.stats.warnings.clone(),
         },
     })
 }

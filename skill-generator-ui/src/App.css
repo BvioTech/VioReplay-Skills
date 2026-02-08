@@ -678,6 +678,54 @@ textarea {
   margin-top: 2px;
 }
 
+.pipeline-warnings {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--color-warn-bg);
+  border: 1px solid var(--color-warn-border);
+  border-radius: var(--radius-md);
+}
+
+.warnings-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-warn-text);
+  margin: 0 0 6px 0;
+}
+
+.warnings-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--color-warn-text);
+  line-height: 1.5;
+}
+
+.error-boundary {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 24px;
+  text-align: center;
+  color: var(--color-text);
+  background: var(--color-bg);
+}
+
+.error-boundary h2 {
+  font-size: 18px;
+  margin-bottom: 8px;
+}
+
+.error-boundary p {
+  font-size: 13px;
+  color: var(--color-text-muted);
+  margin-bottom: 16px;
+  max-width: 400px;
+  word-break: break-word;
+}
+
 .preview-header {
   display: flex;
   justify-content: space-between;

@@ -260,30 +260,57 @@ Respond in JSON format:
             }],
         };
 
-        let response = match self
-            .client
-            .post(&self.api_endpoint)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&request_body)
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                warn!("Failed to call Anthropic API: {}", e);
+        let mut response = None;
+        let max_retries = 3u32;
+        for attempt in 0..max_retries {
+            let result = self
+                .client
+                .post(&self.api_endpoint)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&request_body)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        response = Some(resp);
+                        break;
+                    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        let delay = std::time::Duration::from_secs(2u64.pow(attempt + 1));
+                        warn!("Rate limited (429), retrying in {:?}", delay);
+                        tokio::time::sleep(delay).await;
+                    } else if status.is_server_error() {
+                        let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                        warn!("Server error ({}), retrying in {:?}", status, delay);
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        warn!("Anthropic API returned error status: {}", status);
+                        return None;
+                    }
+                }
+                Err(e) if e.is_timeout() || e.is_connect() => {
+                    let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                    warn!("Network error ({}), retrying in {:?}", e, delay);
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    warn!("Failed to call Anthropic API: {}", e);
+                    return None;
+                }
+            }
+        }
+
+        let response = match response {
+            Some(r) => r,
+            None => {
+                warn!("Anthropic API call failed after {} retries", max_retries);
                 return None;
             }
         };
-
-        if !response.status().is_success() {
-            warn!(
-                "Anthropic API returned error status: {}",
-                response.status()
-            );
-            return None;
-        }
 
         let response_body: AnthropicResponse = match response.json().await {
             Ok(body) => body,

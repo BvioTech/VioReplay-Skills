@@ -187,6 +187,7 @@ impl SkillGenerator {
                 Ok(rt) => Some(rt),
                 Err(e) => {
                     debug!("Failed to create tokio runtime for LLM: {}", e);
+                    stats.warnings.push(format!("Tokio runtime creation failed: {}", e));
                     None
                 }
             }
@@ -199,6 +200,7 @@ impl SkillGenerator {
             if let Some(ref rt) = runtime {
                 self.enrich_with_llm_semantic(&locally_recovered, rt)
             } else {
+                stats.warnings.push("LLM enrichment skipped: no async runtime available".to_string());
                 locally_recovered
             }
         } else {
@@ -209,6 +211,14 @@ impl SkillGenerator {
             .filter(|e| e.raw.event_type.is_click() && e.semantic.is_none())
             .count();
         stats.llm_enriched_count = missing_after_local.saturating_sub(missing_after_llm);
+
+        // Warn if events still lack semantic data after all enrichment
+        if missing_after_llm > 0 {
+            stats.warnings.push(format!(
+                "{} click event(s) still missing semantic data after recovery",
+                missing_after_llm
+            ));
+        }
 
         // Step 1: Extract significant events (clicks, keystrokes)
         let significant_events = self.extract_significant_events(&enriched_recording);
@@ -1495,6 +1505,8 @@ pub struct PipelineStats {
     pub variables_count: usize,
     /// Total generated steps
     pub generated_steps_count: usize,
+    /// Pipeline warnings (partial failures, fallbacks)
+    pub warnings: Vec<String>,
 }
 
 /// A generated skill ready for output
@@ -2648,6 +2660,7 @@ mod tests {
         assert_eq!(stats.trajectory_adjustments_count, 0);
         assert_eq!(stats.variables_count, 0);
         assert_eq!(stats.generated_steps_count, 0);
+        assert!(stats.warnings.is_empty());
     }
 
     #[test]

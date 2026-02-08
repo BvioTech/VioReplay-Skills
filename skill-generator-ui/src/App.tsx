@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, Component } from "react";
+import type { ReactNode, ErrorInfo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
@@ -29,6 +30,7 @@ interface PipelineStatsInfo {
   trajectory_adjustments_count: number;
   variables_count: number;
   generated_steps_count: number;
+  warnings: string[];
 }
 
 interface GeneratedSkillInfo {
@@ -183,6 +185,42 @@ function MarkdownPreview({ content }: { content: string }) {
   }
 
   return <div className="md-preview">{elements}</div>;
+}
+
+class ErrorBoundary extends Component<
+  { children: ReactNode },
+  { hasError: boolean; error: Error | null }
+> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("ErrorBoundary caught:", error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="error-boundary">
+          <h2>Something went wrong</h2>
+          <p>{this.state.error?.message}</p>
+          <button
+            className="btn btn-primary"
+            onClick={() => this.setState({ hasError: false, error: null })}
+          >
+            Try Again
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 function App() {
@@ -832,6 +870,16 @@ function App() {
                   <span className="stat-desc" aria-hidden="true">Trajectory Adjustments</span>
                 </div>
               </div>
+              {pipelineStats.warnings.length > 0 && (
+                <div className="pipeline-warnings" role="alert">
+                  <h3 className="warnings-title">Warnings ({pipelineStats.warnings.length})</h3>
+                  <ul className="warnings-list">
+                    {pipelineStats.warnings.map((w, i) => (
+                      <li key={i}>{w}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </section>
           )}
 
@@ -1240,4 +1288,12 @@ function App() {
   );
 }
 
-export default App;
+function AppWithErrorBoundary() {
+  return (
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
+}
+
+export default AppWithErrorBoundary;

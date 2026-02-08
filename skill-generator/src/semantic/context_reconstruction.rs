@@ -261,31 +261,63 @@ Respond in JSON format:
             context
         );
 
-        // Call Anthropic API using shared client
-        let response = match self.http_client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&serde_json::json!({
-                "model": "claude-sonnet-4-5-20250929",
-                "max_tokens": 512,
-                "messages": [{"role": "user", "content": prompt}]
-            }))
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::warn!("LLM inference API call failed: {}", e);
+        // Call Anthropic API with retry logic
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-5-20250929",
+            "max_tokens": 512,
+            "messages": [{"role": "user", "content": prompt}]
+        });
+
+        let mut response = None;
+        let max_retries = 3u32;
+        for attempt in 0..max_retries {
+            let result = self.http_client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        response = Some(resp);
+                        break;
+                    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        let delay = std::time::Duration::from_secs(2u64.pow(attempt + 1));
+                        tracing::warn!("Rate limited (429), retrying in {:?}", delay);
+                        tokio::time::sleep(delay).await;
+                    } else if status.is_server_error() {
+                        let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                        tracing::warn!("Server error ({}), retrying in {:?}", status, delay);
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        tracing::warn!("LLM inference returned error: {}", status);
+                        return None;
+                    }
+                }
+                Err(e) if e.is_timeout() || e.is_connect() => {
+                    let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                    tracing::warn!("Network error ({}), retrying in {:?}", e, delay);
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    tracing::warn!("LLM inference API call failed: {}", e);
+                    return None;
+                }
+            }
+        }
+
+        let response = match response {
+            Some(r) => r,
+            None => {
+                tracing::warn!("LLM inference failed after {} retries", max_retries);
                 return None;
             }
         };
-
-        if !response.status().is_success() {
-            tracing::warn!("LLM inference returned error: {}", response.status());
-            return None;
-        }
 
         // Parse response
         #[derive(serde::Deserialize)]
