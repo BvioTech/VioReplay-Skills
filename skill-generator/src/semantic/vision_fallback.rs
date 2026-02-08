@@ -285,7 +285,13 @@ impl VisionFallback {
         unsafe {
             // Wrap in autorelease pool to drain autoreleased objects (e.g. arrayWithObject:)
             // on background threads where there's no Cocoa run loop.
-            let pool_class = Class::get("NSAutoreleasePool").expect("NSAutoreleasePool");
+            let pool_class = match Class::get("NSAutoreleasePool") {
+                Some(cls) => cls,
+                None => {
+                    tracing::warn!("NSAutoreleasePool class not found - Objective-C runtime unavailable");
+                    return Vec::new();
+                }
+            };
             let pool: *mut Object = msg_send![pool_class, new];
 
             // Step 1: Create VNImageRequestHandler from CGImage
@@ -482,7 +488,13 @@ impl VisionFallback {
 
         unsafe {
             // Wrap in autorelease pool to drain autoreleased objects on background threads
-            let pool_class = Class::get("NSAutoreleasePool").expect("NSAutoreleasePool");
+            let pool_class = match Class::get("NSAutoreleasePool") {
+                Some(cls) => cls,
+                None => {
+                    tracing::warn!("NSAutoreleasePool class not found - Objective-C runtime unavailable");
+                    return Vec::new();
+                }
+            };
             let pool: *mut Object = msg_send![pool_class, new];
 
             // Create VNImageRequestHandler
