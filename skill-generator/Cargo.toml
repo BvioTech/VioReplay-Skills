@@ -70,9 +70,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 tempfile = "3"
 
-# [[bench]]
-# name = "event_capture"
-# harness = false
+[[bench]]
+name = "event_capture"
+harness = false
 
 [profile.release]
 opt-level = 3
