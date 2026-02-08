@@ -24,6 +24,24 @@ const MAX_SKILL_NAME_LEN: usize = 50;
 /// HTTP timeout for Anthropic API calls
 const API_TIMEOUT_SECS: u64 = 30;
 
+/// Sanitize a user-provided name for safe use in file paths.
+/// Removes path separators, traversal sequences, control chars, and null bytes.
+fn sanitize_filename(name: &str) -> Result<String, String> {
+    if name.contains("..") {
+        return Err("Invalid name: path traversal not allowed".to_string());
+    }
+    let sanitized: String = name.chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\' && *c != '\0')
+        .collect();
+    if sanitized.is_empty() {
+        return Err("Name cannot be empty".to_string());
+    }
+    if sanitized.len() > 255 {
+        return Err("Name too long (max 255 characters)".to_string());
+    }
+    Ok(sanitized)
+}
+
 /// Application state shared across commands
 pub struct AppState {
     /// Current recording (if any)
@@ -160,7 +178,7 @@ fn start_recording(state: State<AppState>, name: String, goal: Option<String>) -
     let recording_name = if name.is_empty() {
         chrono::Local::now().format("recording_%Y%m%d_%H%M%S").to_string()
     } else {
-        name
+        sanitize_filename(&name)?
     };
     let recording = Recording::new(recording_name, goal);
 

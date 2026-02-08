@@ -234,8 +234,8 @@ function App() {
   const lastEventCountRef = useRef(0);
 
   // Input state
-  const [recordingName, setRecordingName] = useState("");
-  const [goal, setGoal] = useState("");
+  const [recordingName, setRecordingName] = useState(() => localStorage.getItem("lastRecordingName") || "");
+  const [goal, setGoal] = useState(() => localStorage.getItem("lastGoal") || "");
   const [apiKey, setApiKey] = useState("");
   const [maskedApiKey, setMaskedApiKey] = useState<string | null>(null);
 
@@ -248,7 +248,10 @@ function App() {
   // UI state
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<Tab>("record");
+  const [activeTab, setActiveTab] = useState<Tab>(() => {
+    const saved = localStorage.getItem("activeTab");
+    return (saved === "record" || saved === "recordings" || saved === "skills" || saved === "settings") ? saved : "record";
+  });
   const [generating, setGenerating] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
@@ -297,6 +300,11 @@ function App() {
       return () => clearTimeout(timer);
     }
   }, [error]);
+
+  // Persist UI state to localStorage
+  useEffect(() => { localStorage.setItem("activeTab", activeTab); }, [activeTab]);
+  useEffect(() => { localStorage.setItem("lastRecordingName", recordingName); }, [recordingName]);
+  useEffect(() => { localStorage.setItem("lastGoal", goal); }, [goal]);
 
   // Poll status while recording
   useEffect(() => {
@@ -363,7 +371,7 @@ function App() {
       setRecordings(list);
     } catch (e) {
       console.error("Failed to load recordings:", e);
-      setError("Failed to load recordings");
+      setError("Failed to load recordings from ~/.skill_generator/recordings. Check permissions and disk space.");
     } finally {
       setLoadingRecordings(false);
     }
@@ -412,7 +420,11 @@ function App() {
       setDuration(0);
     } catch (e: unknown) {
       const errorMsg = e instanceof Error ? e.message : String(e);
-      setError(errorMsg);
+      if (errorMsg.includes("Accessibility")) {
+        setError(`${errorMsg}. To fix: System Settings > Privacy & Security > Accessibility > Enable this app`);
+      } else {
+        setError(errorMsg);
+      }
     }
   }, [recordingName, goal]);
 
@@ -458,7 +470,13 @@ function App() {
       }
     } catch (e: unknown) {
       const errorMsg = e instanceof Error ? e.message : String(e);
-      setError(errorMsg);
+      if (errorMsg.includes("Accessibility")) {
+        setError(`${errorMsg}. To fix: System Settings > Privacy & Security > Accessibility > Enable this app`);
+      } else if (errorMsg.includes("NoSignificantEvents")) {
+        setError("No click or keystroke events found in this recording. Try recording a longer interaction.");
+      } else {
+        setError(errorMsg);
+      }
     } finally {
       setGenerating(null);
     }
