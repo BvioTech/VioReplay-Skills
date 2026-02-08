@@ -484,12 +484,12 @@ include_screenshots = false
         let toml_str = toml::to_string_pretty(&pipeline).expect("Failed to serialize PipelineConfig");
         let deserialized: PipelineConfig = toml::from_str(&toml_str).expect("Failed to deserialize PipelineConfig");
 
-        assert_eq!(deserialized.use_action_clustering, false);
-        assert_eq!(deserialized.use_local_recovery, true);
-        assert_eq!(deserialized.use_vision_ocr, false);
-        assert_eq!(deserialized.use_trajectory_analysis, true);
-        assert_eq!(deserialized.use_goms_detection, false);
-        assert_eq!(deserialized.use_context_tracking, true);
+        assert!(!deserialized.use_action_clustering);
+        assert!(deserialized.use_local_recovery);
+        assert!(!deserialized.use_vision_ocr);
+        assert!(deserialized.use_trajectory_analysis);
+        assert!(!deserialized.use_goms_detection);
+        assert!(deserialized.use_context_tracking);
     }
 
     #[test]
@@ -528,19 +528,19 @@ include_screenshots = false
         let deserialized: Config = toml::from_str(&toml_str).expect("Failed to deserialize Config");
         assert_eq!(deserialized.capture.ring_buffer_size, 4096);
         assert_eq!(deserialized.capture.sampling_rate_hz, 5);
-        assert_eq!(deserialized.capture.vision_fallback, false);
+        assert!(!deserialized.capture.vision_fallback);
         assert_eq!(deserialized.analysis.rdp_epsilon_px, 5.0);
         assert_eq!(deserialized.analysis.hesitation_threshold, 0.5);
         assert_eq!(deserialized.analysis.min_pause_ms, 200);
         assert_eq!(deserialized.codegen.model, "claude-sonnet-4-5-20250929");
         assert_eq!(deserialized.codegen.temperature, 1.0);
-        assert_eq!(deserialized.codegen.include_screenshots, true);
-        assert_eq!(deserialized.pipeline.use_action_clustering, false);
-        assert_eq!(deserialized.pipeline.use_local_recovery, false);
-        assert_eq!(deserialized.pipeline.use_vision_ocr, false);
-        assert_eq!(deserialized.pipeline.use_trajectory_analysis, true);
-        assert_eq!(deserialized.pipeline.use_goms_detection, true);
-        assert_eq!(deserialized.pipeline.use_context_tracking, false);
+        assert!(deserialized.codegen.include_screenshots);
+        assert!(!deserialized.pipeline.use_action_clustering);
+        assert!(!deserialized.pipeline.use_local_recovery);
+        assert!(!deserialized.pipeline.use_vision_ocr);
+        assert!(deserialized.pipeline.use_trajectory_analysis);
+        assert!(deserialized.pipeline.use_goms_detection);
+        assert!(!deserialized.pipeline.use_context_tracking);
     }
 
     #[test]

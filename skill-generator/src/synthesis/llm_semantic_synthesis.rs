@@ -67,6 +67,8 @@ pub struct LlmSynthesizer {
     cache: HashMap<String, CacheEntry>,
     /// Cache TTL in seconds
     cache_ttl: u64,
+    /// Maximum cache entries before eviction
+    max_cache_size: usize,
 }
 
 impl LlmSynthesizer {
@@ -84,6 +86,7 @@ impl LlmSynthesizer {
                 .unwrap_or_else(|_| Client::new()),
             cache: HashMap::new(),
             cache_ttl: 3600, // 1 hour
+            max_cache_size: 1000,
         }
     }
 
@@ -101,6 +104,7 @@ impl LlmSynthesizer {
                 .unwrap_or_else(|_| Client::new()),
             cache: HashMap::new(),
             cache_ttl: 3600,
+            max_cache_size: 1000,
         }
     }
 
@@ -162,12 +166,28 @@ impl LlmSynthesizer {
         })
     }
 
-    /// Cache a result
+    /// Cache a result, evicting expired and oldest entries if at capacity
     fn cache_result(&mut self, key: &str, result: &SynthesisResult) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        // Evict expired entries first
+        if self.cache.len() >= self.max_cache_size {
+            self.cache.retain(|_, entry| now.saturating_sub(entry.timestamp) < self.cache_ttl);
+        }
+
+        // If still at capacity, evict the oldest entry
+        if self.cache.len() >= self.max_cache_size {
+            if let Some(oldest_key) = self.cache.iter()
+                .min_by_key(|(_, entry)| entry.timestamp)
+                .map(|(k, _)| k.clone())
+            {
+                self.cache.remove(&oldest_key);
+            }
+        }
+
         self.cache.insert(
             key.to_string(),
             CacheEntry {
@@ -654,6 +674,30 @@ mod tests {
             synthesizer.api_endpoint,
             "https://api.anthropic.com/v1/messages"
         );
+    }
+
+    #[test]
+    fn test_cache_eviction_at_capacity() {
+        let mut synthesizer = LlmSynthesizer::new();
+        synthesizer.max_cache_size = 3;
+
+        for i in 0..5 {
+            let key = synthesizer.generate_cache_key(&format!("goal{}", i), "input", "question");
+            let result = SynthesisResult {
+                variable_type: format!("type{}", i),
+                inferred_name: format!("var{}", i),
+                derivation: format!("derivation{}", i),
+                confidence: 0.5,
+            };
+            synthesizer.cache_result(&key, &result);
+        }
+
+        // Should never exceed max_cache_size
+        assert!(synthesizer.cache.len() <= 3);
+
+        // Most recent entry should be present
+        let key4 = synthesizer.generate_cache_key("goal4", "input", "question");
+        assert!(synthesizer.get_cached(&key4).is_some());
     }
 
     #[test]
