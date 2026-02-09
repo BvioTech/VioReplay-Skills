@@ -832,6 +832,7 @@ mod tests {
                 semantic: None,
                 id: uuid::Uuid::new_v4(),
                 sequence: i as u64,
+                screenshot_filename: None,
             });
         }
 
@@ -860,6 +861,7 @@ mod tests {
                 semantic: None,
                 id: uuid::Uuid::new_v4(),
                 sequence: i as u64,
+                screenshot_filename: None,
             });
         }
 
@@ -877,6 +879,7 @@ mod tests {
             semantic: None,
             id: uuid::Uuid::new_v4(),
             sequence: 5,
+            screenshot_filename: None,
         });
 
         // Type "world"
@@ -893,6 +896,7 @@ mod tests {
                 semantic: None,
                 id: uuid::Uuid::new_v4(),
                 sequence: (6 + i) as u64,
+                screenshot_filename: None,
             });
         }
 
@@ -922,6 +926,7 @@ mod tests {
                 semantic: None,
                 id: uuid::Uuid::new_v4(),
                 sequence: i as u64,
+                screenshot_filename: None,
             });
         }
 

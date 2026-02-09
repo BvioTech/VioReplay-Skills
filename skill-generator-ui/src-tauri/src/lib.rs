@@ -9,7 +9,13 @@ use skill_generator::time::timebase::MachTimebase;
 use skill_generator::workflow::generator::SkillGenerator;
 use skill_generator::workflow::recording::Recording;
 use skill_generator::capture::EventTap;
+use skill_generator::capture::types::EventType;
+use skill_generator::semantic::screenshot::{ScreenshotConfig, capture_full_screen_jpeg};
+use skill_generator::semantic::screenshot_analysis::{
+    self as sa, AnalysisConfig, AnalysisTier, RecordingAnalysis,
+};
 use std::sync::Mutex;
+use std::sync::mpsc;
 use tauri::State;
 use tracing::{info, warn, error, debug};
 
@@ -23,6 +29,85 @@ const INFERENCE_MAX_TOKENS: u32 = 512;
 const MAX_SKILL_NAME_LEN: usize = 50;
 /// HTTP timeout for Anthropic API calls
 const API_TIMEOUT_SECS: u64 = 30;
+
+/// Minimum interval between screenshot captures (ms)
+const SCREENSHOT_MIN_INTERVAL_MS: u128 = 100;
+
+/// Screenshot capture request sent to background thread
+enum ScreenshotRequest {
+    /// Capture a screenshot with the given sequence number
+    Capture { sequence: u32 },
+    /// Stop the capture thread
+    Stop,
+}
+
+/// Background screenshot capturer
+struct ScreenshotCapturer {
+    sender: mpsc::SyncSender<ScreenshotRequest>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ScreenshotCapturer {
+    /// Create and start a screenshot capture background thread.
+    fn start(screenshots_dir: std::path::PathBuf, config: ScreenshotConfig) -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<ScreenshotRequest>(100);
+
+        let handle = std::thread::spawn(move || {
+            debug!("Screenshot capturer thread started");
+            while let Ok(request) = receiver.recv() {
+                match request {
+                    ScreenshotRequest::Capture { sequence } => {
+                        let filename = format!("{:04}.jpg", sequence);
+                        let filepath = screenshots_dir.join(&filename);
+                        if let Some(screenshot) = capture_full_screen_jpeg(&config) {
+                            if let Err(e) = std::fs::write(&filepath, &screenshot.jpeg_data) {
+                                warn!(error = %e, filename = %filename, "Failed to write screenshot");
+                            }
+                        }
+                    }
+                    ScreenshotRequest::Stop => {
+                        debug!("Screenshot capturer thread stopping");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self {
+            sender,
+            handle: Some(handle),
+        }
+    }
+
+    /// Send a capture request (non-blocking via try_send to avoid stalling the event loop).
+    fn capture(&self, sequence: u32) {
+        if let Err(e) = self.sender.try_send(ScreenshotRequest::Capture { sequence }) {
+            warn!(sequence = sequence, error = %e, "Screenshot capture channel full or disconnected");
+        }
+    }
+
+    /// Stop the capture thread and wait for it to finish.
+    fn stop(self) {
+        let _ = self.sender.send(ScreenshotRequest::Stop);
+        if let Some(handle) = self.handle {
+            if let Err(e) = handle.join() {
+                warn!("Screenshot capturer thread panicked: {:?}", e);
+            }
+        }
+    }
+}
+
+/// Check if an event type is significant enough to warrant a screenshot.
+fn is_significant_event(event_type: EventType) -> bool {
+    matches!(
+        event_type,
+        EventType::LeftMouseDown
+            | EventType::RightMouseDown
+            | EventType::OtherMouseDown
+            | EventType::KeyDown
+            | EventType::ScrollWheel
+    )
+}
 
 /// Sanitize a user-provided name for safe use in file paths.
 /// Removes path separators, traversal sequences, control chars, and null bytes.
@@ -56,10 +141,24 @@ pub struct AppState {
     api_key: Mutex<Option<String>>,
     /// Event count at last checkpoint (for auto-save)
     last_checkpoint_count: Mutex<usize>,
+    /// Screenshot capturer (if active)
+    screenshot_capturer: Mutex<Option<ScreenshotCapturer>>,
+    /// Screenshot sequence counter
+    screenshot_sequence: Mutex<u32>,
+    /// Last screenshot timestamp for rate limiting
+    last_screenshot_time: Mutex<std::time::Instant>,
+    /// Whether screenshot capture is enabled
+    capture_screenshots: Mutex<bool>,
+    /// Lock for serializing analysis file read-modify-write operations
+    analysis_lock: Mutex<()>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        // Load capture_screenshots from persisted config (defaults to true)
+        let capture_ss = Config::load_default()
+            .map(|c| c.capture.capture_screenshots)
+            .unwrap_or(true);
         Self {
             recording: Mutex::new(None),
             event_tap: Mutex::new(None),
@@ -67,6 +166,11 @@ impl Default for AppState {
             is_recording: Mutex::new(false),
             api_key: Mutex::new(None),
             last_checkpoint_count: Mutex::new(0),
+            screenshot_capturer: Mutex::new(None),
+            screenshot_sequence: Mutex::new(0),
+            last_screenshot_time: Mutex::new(std::time::Instant::now()),
+            capture_screenshots: Mutex::new(capture_ss),
+            analysis_lock: Mutex::new(()),
         }
     }
 }
@@ -80,6 +184,8 @@ pub struct RecordingInfo {
     pub duration_ms: u64,
     pub created_at: String,
     pub goal: Option<String>,
+    pub has_screenshots: bool,
+    pub has_analysis: bool,
 }
 
 /// Recording status for frontend
@@ -105,6 +211,7 @@ pub struct PipelineStatsInfo {
     pub noise_filtered_count: usize,
     pub variables_count: usize,
     pub generated_steps_count: usize,
+    pub screenshot_enhanced_count: usize,
     pub warnings: Vec<String>,
 }
 
@@ -116,6 +223,71 @@ pub struct GeneratedSkillInfo {
     pub steps_count: usize,
     pub variables_count: usize,
     pub stats: PipelineStatsInfo,
+}
+
+/// Analysis info for a single screenshot (frontend)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenshotAnalysisInfo {
+    pub sequence: u64,
+    pub filename: String,
+    pub intent: String,
+    pub confidence: f32,
+    pub tier: String,
+    pub user_edited: bool,
+    pub image_path: String,
+}
+
+/// Full analysis result for the frontend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisInfo {
+    pub recording_name: String,
+    pub analyses: Vec<ScreenshotAnalysisInfo>,
+    pub total_screenshots: usize,
+    pub ocr_count: usize,
+    pub vision_count: usize,
+    pub edited_count: usize,
+}
+
+/// Screenshot file info for the frontend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenshotInfo {
+    pub sequence: u32,
+    pub filename: String,
+    pub image_path: String,
+}
+
+/// Convert internal RecordingAnalysis to frontend AnalysisInfo
+fn to_analysis_info(analysis: &RecordingAnalysis, screenshots_dir: &std::path::Path) -> AnalysisInfo {
+    let analyses: Vec<ScreenshotAnalysisInfo> = analysis.analyses.iter().map(|a| {
+        let tier_str = match a.tier {
+            AnalysisTier::LocalOcr => "ocr",
+            AnalysisTier::ClaudeVision => "vision",
+            AnalysisTier::UserEdited => "edited",
+        };
+        ScreenshotAnalysisInfo {
+            sequence: a.sequence,
+            filename: a.filename.clone(),
+            intent: a.intent.clone(),
+            confidence: a.confidence,
+            tier: tier_str.to_string(),
+            user_edited: a.user_edited,
+            image_path: screenshots_dir.join(&a.filename).to_string_lossy().to_string(),
+        }
+    }).collect();
+
+    let ocr_count = analyses.iter().filter(|a| a.tier == "ocr").count();
+    let vision_count = analyses.iter().filter(|a| a.tier == "vision").count();
+    let edited_count = analyses.iter().filter(|a| a.user_edited).count();
+    let total = analyses.len();
+
+    AnalysisInfo {
+        recording_name: analysis.recording_name.clone(),
+        analyses,
+        total_screenshots: total,
+        ocr_count,
+        vision_count,
+        edited_count,
+    }
 }
 
 /// Check if accessibility permissions are granted
@@ -184,7 +356,37 @@ fn start_recording(state: State<AppState>, name: String, goal: Option<String>) -
     } else {
         sanitize_filename(&name)?
     };
-    let recording = Recording::new(recording_name, goal);
+    let recording = Recording::new(recording_name.clone(), goal);
+
+    // Start screenshot capturer if enabled
+    let should_capture = *state.capture_screenshots.lock().map_err(|e| e.to_string())?;
+    if should_capture {
+        let recordings_dir = dirs::home_dir()
+            .ok_or("Could not find home directory")?
+            .join(".skill_generator")
+            .join("recordings");
+        let screenshots_dir = recordings_dir.join(&recording_name).join("screenshots");
+        std::fs::create_dir_all(&screenshots_dir).map_err(|e| e.to_string())?;
+
+        let config = ScreenshotConfig {
+            jpeg_quality: 0.8,
+            max_width: 1024,
+        };
+        let capturer = ScreenshotCapturer::start(screenshots_dir, config);
+
+        let mut ss_cap = state.screenshot_capturer.lock().map_err(|e| e.to_string())?;
+        *ss_cap = Some(capturer);
+    }
+
+    // Reset screenshot sequence
+    {
+        let mut seq = state.screenshot_sequence.lock().map_err(|e| e.to_string())?;
+        *seq = 0;
+    }
+    {
+        let mut last_ss = state.last_screenshot_time.lock().map_err(|e| e.to_string())?;
+        *last_ss = std::time::Instant::now();
+    }
 
     // Store state
     {
@@ -238,8 +440,41 @@ fn get_recording_status(state: State<AppState>) -> Result<RecordingStatus, Strin
 
         if let (Some(ref mut cons), Some(ref mut rec)) = (consumer.as_mut(), recording.as_mut()) {
             let batch = cons.pop_batch(STATUS_POLL_BATCH_SIZE);
+
+            // Get screenshot capturer reference
+            let ss_capturer = state.screenshot_capturer.lock().ok();
+            let mut ss_seq = state.screenshot_sequence.lock().unwrap_or_else(|e| {
+                warn!("Screenshot sequence mutex was poisoned, recovering");
+                e.into_inner()
+            });
+            let mut last_ss_time = state.last_screenshot_time.lock().unwrap_or_else(|e| {
+                warn!("Screenshot timestamp mutex was poisoned, recovering");
+                e.into_inner()
+            });
+
             for slot in batch {
+                let event_type = slot.event.event_type;
                 rec.add_raw_event(slot.event);
+
+                // Capture screenshot for significant events with rate limiting
+                if is_significant_event(event_type) {
+                    let now = std::time::Instant::now();
+                    if now.duration_since(*last_ss_time).as_millis() >= SCREENSHOT_MIN_INTERVAL_MS {
+                        if let Some(ref capturer_lock) = ss_capturer {
+                            if let Some(ref capturer) = **capturer_lock {
+                                let seq = *ss_seq;
+                                capturer.capture(seq);
+                                // Set screenshot filename on the last added event
+                                if let Some(last_event) = rec.events.last_mut() {
+                                    last_event.screenshot_filename =
+                                        Some(format!("{:04}.jpg", seq));
+                                }
+                                *ss_seq += 1;
+                                *last_ss_time = now;
+                            }
+                        }
+                    }
+                }
             }
             event_count = rec.len();
 
@@ -249,7 +484,9 @@ fn get_recording_status(state: State<AppState>) -> Result<RecordingStatus, Strin
                     .unwrap_or_default()
                     .join(".skill_generator")
                     .join("recordings");
-                let cp_path = recordings_dir.join(format!("{}.json", rec.metadata.name));
+                let rec_dir = recordings_dir.join(&rec.metadata.name);
+                let _ = std::fs::create_dir_all(&rec_dir);
+                let cp_path = rec_dir.join("recording.json");
                 let _ = rec.save_checkpoint(&cp_path);
                 did_checkpoint = true;
             }
@@ -300,6 +537,16 @@ fn stop_recording(state: State<AppState>) -> Result<RecordingInfo, String> {
         *event_tap = None;
     }
 
+    // Stop screenshot capturer
+    let had_screenshots = {
+        let mut ss_cap = state.screenshot_capturer.lock().map_err(|e| e.to_string())?;
+        let had = ss_cap.is_some();
+        if let Some(capturer) = ss_cap.take() {
+            capturer.stop();
+        }
+        had
+    };
+
     // Drain remaining events
     {
         let mut consumer = state.consumer.lock().map_err(|e| e.to_string())?;
@@ -309,6 +556,10 @@ fn stop_recording(state: State<AppState>) -> Result<RecordingInfo, String> {
             let batch = cons.pop_batch(STOP_DRAIN_BATCH_SIZE);
             for slot in batch {
                 rec.add_raw_event(slot.event);
+            }
+            // Mark recording as having screenshots
+            if had_screenshots {
+                rec.metadata.has_screenshots = true;
             }
         }
         *consumer = None;
@@ -326,16 +577,17 @@ fn stop_recording(state: State<AppState>) -> Result<RecordingInfo, String> {
             };
             rec.finalize(duration);
 
-            // Save to file
+            // Save to directory format: {name}/recording.json
             let recordings_dir = dirs::home_dir()
                 .ok_or("Could not find home directory")?
                 .join(".skill_generator")
                 .join("recordings");
             std::fs::create_dir_all(&recordings_dir).map_err(|e| e.to_string())?;
 
-            let file_path = recordings_dir.join(format!("{}.json", rec.metadata.name));
-            rec.save(&file_path).map_err(|e| e.to_string())?;
-            Recording::remove_checkpoint(&file_path);
+            let rec_dir = rec.save_to_dir(&recordings_dir).map_err(|e| e.to_string())?;
+            let file_path = rec_dir.join("recording.json");
+            // Remove any old-format checkpoint
+            Recording::remove_checkpoint(&recordings_dir.join(format!("{}.json", rec.metadata.name)));
 
             let info = RecordingInfo {
                 name: rec.metadata.name.clone(),
@@ -344,6 +596,8 @@ fn stop_recording(state: State<AppState>) -> Result<RecordingInfo, String> {
                 duration_ms: rec.metadata.duration_ms,
                 created_at: rec.metadata.started_at.to_rfc3339(),
                 goal: rec.metadata.goal.clone(),
+                has_screenshots: rec.metadata.has_screenshots,
+                has_analysis: false,
             };
 
             *recording = None;
@@ -380,6 +634,28 @@ fn list_recordings() -> Result<Vec<RecordingInfo>, String> {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
 
+        // Directory format: {name}/recording.json
+        if path.is_dir() {
+            let recording_json = path.join("recording.json");
+            if recording_json.exists() {
+                if let Ok(recording) = Recording::load(&recording_json) {
+                    let has_analysis = path.join("analysis.json").exists();
+                    recordings.push(RecordingInfo {
+                        name: recording.metadata.name.clone(),
+                        path: recording_json.to_string_lossy().to_string(),
+                        event_count: recording.len(),
+                        duration_ms: recording.metadata.duration_ms,
+                        created_at: recording.metadata.started_at.to_rfc3339(),
+                        goal: recording.metadata.goal.clone(),
+                        has_screenshots: recording.metadata.has_screenshots,
+                        has_analysis,
+                    });
+                }
+            }
+            continue;
+        }
+
+        // Flat format: {name}.json (backward compat)
         if path.extension().map(|e| e == "json").unwrap_or(false) {
             if let Ok(recording) = Recording::load(&path) {
                 recordings.push(RecordingInfo {
@@ -389,6 +665,8 @@ fn list_recordings() -> Result<Vec<RecordingInfo>, String> {
                     duration_ms: recording.metadata.duration_ms,
                     created_at: recording.metadata.started_at.to_rfc3339(),
                     goal: recording.metadata.goal.clone(),
+                    has_screenshots: false,
+                    has_analysis: false,
                 });
             }
         }
@@ -605,12 +883,14 @@ Requirements for name:
     })
 }
 
-/// Generate SKILL.md from a recording
+/// Generate SKILL.md from a recording.
+///
+/// Runs on a background thread via `spawn_blocking` so the UI stays responsive.
 #[tauri::command(rename_all = "camelCase")]
-fn generate_skill(state: State<AppState>, recording_path: String) -> Result<GeneratedSkillInfo, String> {
+async fn generate_skill(state: State<'_, AppState>, recording_path: String) -> Result<GeneratedSkillInfo, String> {
     info!(path = recording_path, "Starting skill generation");
 
-    // Get API key from state
+    // Extract state before the async boundary
     let api_key_value = state.api_key.lock().map_err(|e| e.to_string())?.clone();
     match &api_key_value {
         Some(key) if !key.is_empty() => {
@@ -621,105 +901,318 @@ fn generate_skill(state: State<AppState>, recording_path: String) -> Result<Gene
         }
     }
 
-    let path = std::path::Path::new(&recording_path);
+    tokio::task::spawn_blocking(move || {
+        let path = std::path::Path::new(&recording_path);
 
-    if !path.exists() {
-        return Err(format!("Recording not found: {}", recording_path));
+        if !path.exists() {
+            return Err(format!("Recording not found: {}", recording_path));
+        }
+
+        // Load recording
+        let recording = Recording::load(path).map_err(|e| e.to_string())?;
+        info!(event_count = recording.len(), "Recording loaded");
+
+        // Load config for pipeline settings and model name
+        let config = Config::load_default().unwrap_or_else(|e| {
+            warn!("Failed to load config, using defaults: {}", e);
+            Config::default()
+        });
+
+        // Check if screenshot analysis exists for this recording
+        let screenshot_analysis = if let Some(parent) = path.parent() {
+            match sa::load_analysis(parent) {
+                Ok(analysis) => {
+                    let intents: Vec<(u64, String)> = analysis.analyses.iter()
+                        .filter(|a| !a.intent.trim().is_empty())
+                        .map(|a| (a.sequence, a.intent.clone()))
+                        .collect();
+                    if intents.is_empty() {
+                        debug!("Screenshot analysis loaded but no usable intents found");
+                        None
+                    } else {
+                        info!(count = intents.len(), "Loaded screenshot analysis for generation");
+                        Some(intents)
+                    }
+                }
+                Err(e) => {
+                    // Not an error if analysis.json simply doesn't exist
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!(error = %e, "Failed to load screenshot analysis");
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Create generator with API key and pipeline config from state
+        let gen_config = skill_generator::workflow::generator::GeneratorConfig {
+            api_key: api_key_value.clone(),
+            use_action_clustering: config.pipeline.use_action_clustering,
+            use_local_recovery: config.pipeline.use_local_recovery,
+            use_vision_ocr: config.pipeline.use_vision_ocr,
+            use_trajectory_analysis: config.pipeline.use_trajectory_analysis,
+            use_goms_detection: config.pipeline.use_goms_detection,
+            use_context_tracking: config.pipeline.use_context_tracking,
+            screenshot_analysis,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(gen_config);
+
+        // Generate skill
+        let mut skill = generator.generate(&recording).map_err(|e| e.to_string())?;
+        info!(steps = skill.steps.len(), "Base skill generated");
+
+        // Try to infer a better name, description, and category using AI
+        let steps_summary: String = skill.steps.iter()
+            .take(5)
+            .map(|s| format!("- {}", s.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let inferred = infer_skill_from_recording(
+            &recording,
+            &steps_summary,
+            &config.codegen.model,
+            api_key_value.as_deref(),
+        );
+
+        if let Some(ref meta) = inferred {
+            skill.name = meta.name.clone();
+            if !meta.description.trim().is_empty() {
+                skill.description = meta.description.clone();
+            } else if let Some(goal) = recording.metadata.goal.clone() {
+                skill.description = goal;
+            }
+        }
+
+        // Save skill (category/name)
+        let base_dir = dirs::home_dir()
+            .ok_or("Could not find home directory".to_string())?
+            .join(".claude")
+            .join("skills");
+
+        let category_dir = if let Some(ref meta) = inferred {
+            meta.category.clone().unwrap_or_else(|| {
+                skill.name.split('-').next().unwrap_or("misc").to_string()
+            })
+        } else {
+            skill.name.split('-').next().unwrap_or("misc").to_string()
+        };
+
+        let skills_dir = base_dir.join(category_dir).join(&skill.name);
+        std::fs::create_dir_all(&skills_dir).map_err(|e| e.to_string())?;
+
+        let skill_path = skills_dir.join("SKILL.md");
+        generator.save_skill(&skill, &skill_path).map_err(|e| e.to_string())?;
+
+        Ok(GeneratedSkillInfo {
+            name: skill.name.clone(),
+            path: skill_path.to_string_lossy().to_string(),
+            steps_count: skill.steps.len(),
+            variables_count: skill.variables.len(),
+            stats: PipelineStatsInfo {
+                local_recovery_count: skill.stats.local_recovery_count,
+                llm_enriched_count: skill.stats.llm_enriched_count,
+                goms_boundaries_count: skill.stats.goms_boundaries_count,
+                context_transitions_count: skill.stats.context_transitions_count,
+                unit_tasks_count: skill.stats.unit_tasks_count,
+                significant_events_count: skill.stats.significant_events_count,
+                trajectory_adjustments_count: skill.stats.trajectory_adjustments_count,
+                noise_filtered_count: skill.stats.noise_filtered_count,
+                variables_count: skill.stats.variables_count,
+                generated_steps_count: skill.stats.generated_steps_count,
+                screenshot_enhanced_count: skill.stats.screenshot_enhanced_count,
+                warnings: skill.stats.warnings.clone(),
+            },
+        })
+    }).await.map_err(|e| format!("Generation task failed: {}", e))?
+}
+
+/// Run tiered AI analysis on a recording's screenshots.
+///
+/// Runs on a background thread via `spawn_blocking` so the UI stays responsive.
+#[tauri::command(rename_all = "camelCase")]
+async fn analyze_recording(state: State<'_, AppState>, recording_name: String) -> Result<AnalysisInfo, String> {
+    let name = sanitize_filename(&recording_name)?;
+    // Extract state before the async boundary
+    let api_key_value = state.api_key.lock().map_err(|e| e.to_string())?.clone();
+
+    info!(name = %name, "Starting screenshot analysis");
+
+    tokio::task::spawn_blocking(move || {
+        let recordings_dir = dirs::home_dir()
+            .ok_or("Could not find home directory".to_string())?
+            .join(".skill_generator")
+            .join("recordings");
+
+        let rec_dir = Recording::recording_dir(&recordings_dir, &name);
+        let recording_json = rec_dir.join("recording.json");
+
+        if !recording_json.exists() {
+            return Err(format!("Recording not found: {}", name));
+        }
+
+        let screenshots_dir = Recording::screenshots_dir(&rec_dir);
+
+        if !screenshots_dir.exists() {
+            return Err("No screenshots found for this recording".to_string());
+        }
+
+        let recording = Recording::load(&recording_json).map_err(|e| e.to_string())?;
+
+        let app_config = Config::load_default().unwrap_or_else(|e| {
+            warn!("Failed to load config for analysis, using defaults: {}", e);
+            Config::default()
+        });
+        let config = AnalysisConfig {
+            claude_model: app_config.codegen.vision_model.clone(),
+            ..AnalysisConfig::default()
+        };
+
+        let analysis = sa::analyze_recording(
+            &rec_dir,
+            &recording,
+            api_key_value.as_deref(),
+            &config,
+        );
+
+        sa::save_analysis(&analysis, &rec_dir).map_err(|e| e.to_string())?;
+
+        info!(
+            name = %name,
+            count = analysis.analyses.len(),
+            "Analysis complete and saved"
+        );
+
+        Ok(to_analysis_info(&analysis, &screenshots_dir))
+    }).await.map_err(|e| format!("Analysis task failed: {}", e))?
+}
+
+/// Get existing analysis for a recording (if available)
+#[tauri::command(rename_all = "camelCase")]
+fn get_analysis(recording_name: String) -> Result<Option<AnalysisInfo>, String> {
+    let name = sanitize_filename(&recording_name)?;
+    let recordings_dir = dirs::home_dir()
+        .ok_or("Could not find home directory")?
+        .join(".skill_generator")
+        .join("recordings");
+
+    let rec_dir = Recording::recording_dir(&recordings_dir, &name);
+    let screenshots_dir = Recording::screenshots_dir(&rec_dir);
+
+    match sa::load_analysis(&rec_dir) {
+        Ok(analysis) => Ok(Some(to_analysis_info(&analysis, &screenshots_dir))),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Update a single intent in the analysis
+#[tauri::command(rename_all = "camelCase")]
+fn update_intent(state: State<AppState>, recording_name: String, sequence: u64, new_intent: String) -> Result<(), String> {
+    let name = sanitize_filename(&recording_name)?;
+    let recordings_dir = dirs::home_dir()
+        .ok_or("Could not find home directory")?
+        .join(".skill_generator")
+        .join("recordings");
+
+    let rec_dir = Recording::recording_dir(&recordings_dir, &name);
+
+    // Serialize analysis file access to prevent read-modify-write races
+    let _lock = state.analysis_lock.lock().map_err(|e| e.to_string())?;
+
+    let mut analysis = sa::load_analysis(&rec_dir).map_err(|e| e.to_string())?;
+
+    let entry = analysis.analyses.iter_mut()
+        .find(|a| a.sequence == sequence)
+        .ok_or_else(|| format!("No analysis found for sequence {}", sequence))?;
+
+    entry.intent = new_intent;
+    entry.user_edited = true;
+    entry.tier = AnalysisTier::UserEdited;
+
+    sa::save_analysis(&analysis, &rec_dir).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// List screenshot files for a recording
+#[tauri::command(rename_all = "camelCase")]
+fn list_screenshots(recording_name: String) -> Result<Vec<ScreenshotInfo>, String> {
+    let name = sanitize_filename(&recording_name)?;
+    let recordings_dir = dirs::home_dir()
+        .ok_or("Could not find home directory")?
+        .join(".skill_generator")
+        .join("recordings");
+
+    let rec_dir = Recording::recording_dir(&recordings_dir, &name);
+    let screenshots_dir = Recording::screenshots_dir(&rec_dir);
+
+    if !screenshots_dir.exists() {
+        return Ok(vec![]);
     }
 
-    // Load recording
-    let recording = Recording::load(path).map_err(|e| e.to_string())?;
-    info!(event_count = recording.len(), "Recording loaded");
+    let mut screenshots = Vec::new();
 
-    // Load config for pipeline settings and model name
-    let config = Config::load_default().unwrap_or_else(|e| {
-        warn!("Failed to load config, using defaults: {}", e);
-        Config::default()
-    });
+    for entry in std::fs::read_dir(&screenshots_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
 
-    // Create generator with API key and pipeline config from state
-    let gen_config = skill_generator::workflow::generator::GeneratorConfig {
-        api_key: api_key_value.clone(),
-        use_action_clustering: config.pipeline.use_action_clustering,
-        use_local_recovery: config.pipeline.use_local_recovery,
-        use_vision_ocr: config.pipeline.use_vision_ocr,
-        use_trajectory_analysis: config.pipeline.use_trajectory_analysis,
-        use_goms_detection: config.pipeline.use_goms_detection,
-        use_context_tracking: config.pipeline.use_context_tracking,
-        ..Default::default()
-    };
-    let generator = SkillGenerator::with_config(gen_config);
+        if path.extension().map(|e| e == "jpg").unwrap_or(false) {
+            let filename = path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
 
-    // Generate skill
-    let mut skill = generator.generate(&recording).map_err(|e| e.to_string())?;
-    info!(steps = skill.steps.len(), "Base skill generated");
+            // Parse sequence from filename (e.g., "0005.jpg" -> 5)
+            let sequence = filename.trim_end_matches(".jpg")
+                .parse::<u32>()
+                .unwrap_or(0);
 
-    // Try to infer a better name, description, and category using AI
-    let steps_summary: String = skill.steps.iter()
-        .take(5)
-        .map(|s| format!("- {}", s.description))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let inferred = infer_skill_from_recording(
-        &recording,
-        &steps_summary,
-        &config.codegen.model,
-        api_key_value.as_deref(),
-    );
-
-    if let Some(ref meta) = inferred {
-        skill.name = meta.name.clone();
-        if !meta.description.trim().is_empty() {
-            skill.description = meta.description.clone();
-        } else if let Some(goal) = recording.metadata.goal.clone() {
-            skill.description = goal;
+            screenshots.push(ScreenshotInfo {
+                sequence,
+                filename,
+                image_path: path.to_string_lossy().to_string(),
+            });
         }
     }
 
-    // Save skill (category/name)
-    let base_dir = dirs::home_dir()
-        .ok_or("Could not find home directory")?
-        .join(".claude")
-        .join("skills");
+    screenshots.sort_by_key(|s| s.sequence);
 
-    let category_dir = if let Some(ref meta) = inferred {
-        meta.category.clone().unwrap_or_else(|| {
-            skill.name.split('-').next().unwrap_or("misc").to_string()
-        })
-    } else {
-        skill.name.split('-').next().unwrap_or("misc").to_string()
-    };
-
-    let skills_dir = base_dir.join(category_dir).join(&skill.name);
-    std::fs::create_dir_all(&skills_dir).map_err(|e| e.to_string())?;
-
-    let skill_path = skills_dir.join("SKILL.md");
-    generator.save_skill(&skill, &skill_path).map_err(|e| e.to_string())?;
-
-    Ok(GeneratedSkillInfo {
-        name: skill.name.clone(),
-        path: skill_path.to_string_lossy().to_string(),
-        steps_count: skill.steps.len(),
-        variables_count: skill.variables.len(),
-        stats: PipelineStatsInfo {
-            local_recovery_count: skill.stats.local_recovery_count,
-            llm_enriched_count: skill.stats.llm_enriched_count,
-            goms_boundaries_count: skill.stats.goms_boundaries_count,
-            context_transitions_count: skill.stats.context_transitions_count,
-            unit_tasks_count: skill.stats.unit_tasks_count,
-            significant_events_count: skill.stats.significant_events_count,
-            trajectory_adjustments_count: skill.stats.trajectory_adjustments_count,
-            noise_filtered_count: skill.stats.noise_filtered_count,
-            variables_count: skill.stats.variables_count,
-            generated_steps_count: skill.stats.generated_steps_count,
-            warnings: skill.stats.warnings.clone(),
-        },
-    })
+    Ok(screenshots)
 }
 
-/// Open a file or folder in the system file manager
+/// Open a file or folder in the system file manager.
+///
+/// Only allows paths within the recordings or skills directories.
 #[tauri::command]
 fn open_in_finder(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("Path not found: {}", path));
+    }
+    if p.is_symlink() {
+        return Err("Cannot open symlinks".to_string());
+    }
+
+    // Validate path is within allowed directories
+    let home = dirs::home_dir().ok_or("Could not find home directory")?;
+    let recordings_dir = home.join(".skill_generator").join("recordings");
+    let skills_dir = home.join(".claude").join("skills");
+
+    let canonical = std::fs::canonicalize(p).map_err(|e| e.to_string())?;
+    let in_recordings = recordings_dir.exists()
+        && std::fs::canonicalize(&recordings_dir)
+            .map(|d| canonical.starts_with(&d))
+            .unwrap_or(false);
+    let in_skills = skills_dir.exists()
+        && std::fs::canonicalize(&skills_dir)
+            .map(|d| canonical.starts_with(&d))
+            .unwrap_or(false);
+
+    if !in_recordings && !in_skills {
+        return Err("Access denied: path is outside allowed directories".to_string());
+    }
+
     std::process::Command::new("open")
         .arg("-R")
         .arg(&path)
@@ -752,6 +1245,10 @@ fn delete_recording(name: Option<String>, recording_path: Option<String>) -> Res
         if !path.exists() {
             return Err(format!("Recording not found: {}", target));
         }
+        // Reject symlinks to prevent path traversal attacks
+        if path.is_symlink() {
+            return Err("Cannot delete symlinks".to_string());
+        }
         let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
         let canonical_dir = std::fs::canonicalize(&recordings_dir).map_err(|e| e.to_string())?;
         if !canonical.starts_with(&canonical_dir) {
@@ -759,13 +1256,20 @@ fn delete_recording(name: Option<String>, recording_path: Option<String>) -> Res
         }
         canonical
     } else {
-        // Treat as a name - look up in recordings dir
+        // Treat as a name - look up in recordings dir (flat file first, then directory)
         let file_path = recordings_dir.join(format!("{}.json", target));
-        if file_path.exists() {
+        if file_path.exists() && !file_path.is_symlink() {
             file_path
         } else {
             let dir_path = recordings_dir.join(&target);
+            if dir_path.is_symlink() {
+                return Err("Cannot delete symlinks".to_string());
+            }
             if dir_path.exists() && dir_path.is_dir() {
+                // Validate it's actually a recording directory
+                if !dir_path.join("recording.json").exists() {
+                    return Err(format!("Not a valid recording directory: {}", target));
+                }
                 dir_path
             } else {
                 return Err(format!("Recording not found: {}", target));
@@ -789,6 +1293,8 @@ pub struct UiConfig {
     pub hesitation_threshold: f64,
     pub min_pause_ms: u64,
     pub model: String,
+    #[serde(default = "default_vision_model")]
+    pub vision_model: String,
     pub temperature: f32,
     pub use_action_clustering: bool,
     pub use_local_recovery: bool,
@@ -796,17 +1302,25 @@ pub struct UiConfig {
     pub use_trajectory_analysis: bool,
     pub use_goms_detection: bool,
     pub use_context_tracking: bool,
+    #[serde(default = "default_capture_screenshots")]
+    pub capture_screenshots: bool,
 }
+
+fn default_capture_screenshots() -> bool { true }
+fn default_vision_model() -> String { "claude-haiku-4-5-20250929".to_string() }
 
 /// Get current generator configuration
 #[tauri::command]
-fn get_config() -> Result<UiConfig, String> {
+fn get_config(state: State<AppState>) -> Result<UiConfig, String> {
     let config = Config::load_default().map_err(|e| e.to_string())?;
+    // Use in-memory value which stays in sync with the persisted config
+    let capture_screenshots = *state.capture_screenshots.lock().map_err(|e| e.to_string())?;
     Ok(UiConfig {
         rdp_epsilon_px: config.analysis.rdp_epsilon_px,
         hesitation_threshold: config.analysis.hesitation_threshold,
         min_pause_ms: config.analysis.min_pause_ms,
         model: config.codegen.model,
+        vision_model: config.codegen.vision_model,
         temperature: config.codegen.temperature,
         use_action_clustering: config.pipeline.use_action_clustering,
         use_local_recovery: config.pipeline.use_local_recovery,
@@ -814,17 +1328,19 @@ fn get_config() -> Result<UiConfig, String> {
         use_trajectory_analysis: config.pipeline.use_trajectory_analysis,
         use_goms_detection: config.pipeline.use_goms_detection,
         use_context_tracking: config.pipeline.use_context_tracking,
+        capture_screenshots,
     })
 }
 
 /// Save generator configuration
 #[tauri::command]
-fn save_config(config: UiConfig) -> Result<(), String> {
+fn save_config(state: State<AppState>, config: UiConfig) -> Result<(), String> {
     let mut full_config = Config::load_default().map_err(|e| e.to_string())?;
     full_config.analysis.rdp_epsilon_px = config.rdp_epsilon_px;
     full_config.analysis.hesitation_threshold = config.hesitation_threshold;
     full_config.analysis.min_pause_ms = config.min_pause_ms;
     full_config.codegen.model = config.model;
+    full_config.codegen.vision_model = config.vision_model;
     full_config.codegen.temperature = config.temperature;
     full_config.pipeline.use_action_clustering = config.use_action_clustering;
     full_config.pipeline.use_local_recovery = config.use_local_recovery;
@@ -832,8 +1348,14 @@ fn save_config(config: UiConfig) -> Result<(), String> {
     full_config.pipeline.use_trajectory_analysis = config.use_trajectory_analysis;
     full_config.pipeline.use_goms_detection = config.use_goms_detection;
     full_config.pipeline.use_context_tracking = config.use_context_tracking;
+    full_config.capture.capture_screenshots = config.capture_screenshots;
     full_config.validate().map_err(|e| e.to_string())?;
     full_config.save_default().map_err(|e| e.to_string())?;
+
+    // Update in-memory screenshot capture toggle
+    let mut capture_ss = state.capture_screenshots.lock().map_err(|e| e.to_string())?;
+    *capture_ss = config.capture_screenshots;
+
     info!("Configuration saved");
     Ok(())
 }
@@ -982,6 +1504,9 @@ fn delete_skill(skill_path: String) -> Result<(), String> {
     if !path.exists() {
         return Err(format!("Skill not found: {}", skill_path));
     }
+    if path.is_symlink() {
+        return Err("Cannot delete symlinks".to_string());
+    }
 
     let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
     let canonical_dir = std::fs::canonicalize(&skills_dir).map_err(|e| e.to_string())?;
@@ -990,11 +1515,14 @@ fn delete_skill(skill_path: String) -> Result<(), String> {
     }
 
     // Delete the skill directory (parent of SKILL.md)
-    if let Some(parent) = path.parent() {
-        if parent.starts_with(&skills_dir) && parent != skills_dir {
+    if let Some(parent) = canonical.parent() {
+        if parent.starts_with(&canonical_dir) && parent != canonical_dir {
+            if parent.is_symlink() {
+                return Err("Cannot delete symlinks".to_string());
+            }
             std::fs::remove_dir_all(parent).map_err(|e| e.to_string())?;
         } else {
-            std::fs::remove_file(path).map_err(|e| e.to_string())?;
+            std::fs::remove_file(&canonical).map_err(|e| e.to_string())?;
         }
     }
 
@@ -1048,6 +1576,10 @@ pub fn run() {
             export_config,
             import_config,
             read_recording_file,
+            analyze_recording,
+            get_analysis,
+            update_intent,
+            list_screenshots,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1146,6 +1678,7 @@ mod tests {
             noise_filtered_count: 0,
             variables_count: 8,
             generated_steps_count: 9,
+            screenshot_enhanced_count: 0,
             warnings: vec!["test warning".to_string()],
         };
         let json = serde_json::to_string(&stats).unwrap();
@@ -1172,6 +1705,7 @@ mod tests {
                 noise_filtered_count: 0,
                 variables_count: 2,
                 generated_steps_count: 5,
+                screenshot_enhanced_count: 0,
                 warnings: vec![],
             },
         };
@@ -1191,11 +1725,15 @@ mod tests {
             duration_ms: 5000,
             created_at: "2026-02-08T00:00:00Z".to_string(),
             goal: Some("Test goal".to_string()),
+            has_screenshots: true,
+            has_analysis: false,
         };
         let json = serde_json::to_string(&info).unwrap();
         let deserialized: RecordingInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.event_count, 100);
         assert_eq!(deserialized.goal, Some("Test goal".to_string()));
+        assert!(deserialized.has_screenshots);
+        assert!(!deserialized.has_analysis);
     }
 
     #[test]
@@ -1214,7 +1752,8 @@ mod tests {
             rdp_epsilon_px: 2.0,
             hesitation_threshold: 150.0,
             min_pause_ms: 300,
-            model: "claude-sonnet-4-5-20250929".to_string(),
+            model: "claude-opus-4-6".to_string(),
+            vision_model: "claude-haiku-4-5-20250929".to_string(),
             temperature: 0.7,
             use_action_clustering: true,
             use_local_recovery: true,
@@ -1222,10 +1761,12 @@ mod tests {
             use_trajectory_analysis: true,
             use_goms_detection: true,
             use_context_tracking: true,
+            capture_screenshots: true,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: UiConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(deserialized.model, "claude-opus-4-6");
+        assert_eq!(deserialized.vision_model, "claude-haiku-4-5-20250929");
         assert!(!deserialized.use_vision_ocr);
         assert!((deserialized.temperature - 0.7).abs() < f32::EPSILON);
     }
@@ -1302,5 +1843,259 @@ mod tests {
     #[test]
     fn test_sanitize_category_empty_after_filter() {
         assert_eq!(sanitize_category(Some("!@#".to_string())), None);
+    }
+
+    // --- Analysis response type tests ---
+
+    #[test]
+    fn test_screenshot_analysis_info_serialization() {
+        let info = ScreenshotAnalysisInfo {
+            sequence: 3,
+            filename: "0003.jpg".to_string(),
+            intent: "Click the Save button".to_string(),
+            confidence: 0.85,
+            tier: "ocr".to_string(),
+            user_edited: false,
+            image_path: "/tmp/screenshots/0003.jpg".to_string(),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let deserialized: ScreenshotAnalysisInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.sequence, 3);
+        assert_eq!(deserialized.tier, "ocr");
+        assert!(!deserialized.user_edited);
+    }
+
+    #[test]
+    fn test_analysis_info_serialization() {
+        let info = AnalysisInfo {
+            recording_name: "test-recording".to_string(),
+            analyses: vec![
+                ScreenshotAnalysisInfo {
+                    sequence: 0,
+                    filename: "0000.jpg".to_string(),
+                    intent: "Click button".to_string(),
+                    confidence: 0.9,
+                    tier: "vision".to_string(),
+                    user_edited: false,
+                    image_path: "/tmp/0000.jpg".to_string(),
+                },
+            ],
+            total_screenshots: 1,
+            ocr_count: 0,
+            vision_count: 1,
+            edited_count: 0,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let deserialized: AnalysisInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.recording_name, "test-recording");
+        assert_eq!(deserialized.total_screenshots, 1);
+        assert_eq!(deserialized.vision_count, 1);
+    }
+
+    #[test]
+    fn test_screenshot_info_serialization() {
+        let info = ScreenshotInfo {
+            sequence: 5,
+            filename: "0005.jpg".to_string(),
+            image_path: "/tmp/screenshots/0005.jpg".to_string(),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let deserialized: ScreenshotInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.sequence, 5);
+        assert_eq!(deserialized.filename, "0005.jpg");
+    }
+
+    // --- Screenshot analysis file I/O tests ---
+
+    #[test]
+    fn test_analysis_save_load_roundtrip() {
+        use skill_generator::semantic::screenshot_analysis::{
+            ScreenshotAnalysis, RecordingAnalysis, AnalysisTier,
+        };
+
+        let tmp = std::env::temp_dir().join("test_analysis_roundtrip");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let analysis = RecordingAnalysis {
+            recording_name: "roundtrip-test".to_string(),
+            analyses: vec![
+                ScreenshotAnalysis {
+                    sequence: 0,
+                    filename: "0000.jpg".to_string(),
+                    intent: "Click the save button".to_string(),
+                    ocr_text: Some("Save".to_string()),
+                    confidence: 0.85,
+                    tier: AnalysisTier::LocalOcr,
+                    user_edited: false,
+                },
+            ],
+            created_at: chrono::Utc::now(),
+        };
+
+        sa::save_analysis(&analysis, &tmp).unwrap();
+        let loaded = sa::load_analysis(&tmp).unwrap();
+        assert_eq!(loaded.recording_name, "roundtrip-test");
+        assert_eq!(loaded.analyses.len(), 1);
+        assert_eq!(loaded.analyses[0].intent, "Click the save button");
+        assert_eq!(loaded.analyses[0].tier, AnalysisTier::LocalOcr);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_analysis_update_intent_roundtrip() {
+        use skill_generator::semantic::screenshot_analysis::{
+            ScreenshotAnalysis, RecordingAnalysis, AnalysisTier,
+        };
+
+        let tmp = std::env::temp_dir().join("test_analysis_update");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let analysis = RecordingAnalysis {
+            recording_name: "update-test".to_string(),
+            analyses: vec![
+                ScreenshotAnalysis {
+                    sequence: 0,
+                    filename: "0000.jpg".to_string(),
+                    intent: "Original intent".to_string(),
+                    ocr_text: None,
+                    confidence: 0.5,
+                    tier: AnalysisTier::LocalOcr,
+                    user_edited: false,
+                },
+                ScreenshotAnalysis {
+                    sequence: 1,
+                    filename: "0001.jpg".to_string(),
+                    intent: "Second intent".to_string(),
+                    ocr_text: None,
+                    confidence: 0.6,
+                    tier: AnalysisTier::LocalOcr,
+                    user_edited: false,
+                },
+            ],
+            created_at: chrono::Utc::now(),
+        };
+
+        sa::save_analysis(&analysis, &tmp).unwrap();
+
+        // Simulate what update_intent does: load, modify, save
+        let mut loaded = sa::load_analysis(&tmp).unwrap();
+        let entry = loaded.analyses.iter_mut()
+            .find(|a| a.sequence == 0)
+            .unwrap();
+        entry.intent = "Updated intent".to_string();
+        entry.user_edited = true;
+        entry.tier = AnalysisTier::UserEdited;
+        sa::save_analysis(&loaded, &tmp).unwrap();
+
+        // Verify the update persisted and didn't corrupt other entries
+        let reloaded = sa::load_analysis(&tmp).unwrap();
+        assert_eq!(reloaded.analyses[0].intent, "Updated intent");
+        assert!(reloaded.analyses[0].user_edited);
+        assert_eq!(reloaded.analyses[0].tier, AnalysisTier::UserEdited);
+        assert_eq!(reloaded.analyses[1].intent, "Second intent");
+        assert!(!reloaded.analyses[1].user_edited);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_load_analysis_not_found() {
+        let tmp = std::env::temp_dir().join("test_analysis_not_found");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let result = sa::load_analysis(&tmp);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_list_screenshots_from_disk() {
+        let tmp = std::env::temp_dir().join("test_list_screenshots");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let ss_dir = tmp.join("screenshots");
+        std::fs::create_dir_all(&ss_dir).unwrap();
+
+        // Create fake screenshot files
+        std::fs::write(ss_dir.join("0000.jpg"), b"\xFF\xD8fake").unwrap();
+        std::fs::write(ss_dir.join("0001.jpg"), b"\xFF\xD8fake").unwrap();
+        std::fs::write(ss_dir.join("not-a-screenshot.txt"), b"nope").unwrap();
+
+        // Read dir and filter .jpg files
+        let mut screenshots: Vec<String> = std::fs::read_dir(&ss_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path().extension().map(|ext| ext == "jpg").unwrap_or(false)
+            })
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        screenshots.sort();
+
+        assert_eq!(screenshots.len(), 2);
+        assert_eq!(screenshots[0], "0000.jpg");
+        assert_eq!(screenshots[1], "0001.jpg");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_to_analysis_info_conversion() {
+        use skill_generator::semantic::screenshot_analysis::{
+            ScreenshotAnalysis, RecordingAnalysis, AnalysisTier,
+        };
+
+        let analysis = RecordingAnalysis {
+            recording_name: "test".to_string(),
+            analyses: vec![
+                ScreenshotAnalysis {
+                    sequence: 0,
+                    filename: "0000.jpg".to_string(),
+                    intent: "Click button".to_string(),
+                    ocr_text: Some("OK".to_string()),
+                    confidence: 0.8,
+                    tier: AnalysisTier::LocalOcr,
+                    user_edited: false,
+                },
+                ScreenshotAnalysis {
+                    sequence: 1,
+                    filename: "0001.jpg".to_string(),
+                    intent: "Type in search field".to_string(),
+                    ocr_text: None,
+                    confidence: 0.9,
+                    tier: AnalysisTier::ClaudeVision,
+                    user_edited: false,
+                },
+                ScreenshotAnalysis {
+                    sequence: 2,
+                    filename: "0002.jpg".to_string(),
+                    intent: "User corrected intent".to_string(),
+                    ocr_text: None,
+                    confidence: 1.0,
+                    tier: AnalysisTier::UserEdited,
+                    user_edited: true,
+                },
+            ],
+            created_at: chrono::Utc::now(),
+        };
+
+        let screenshots_dir = std::path::Path::new("/tmp/screenshots");
+        let info = to_analysis_info(&analysis, screenshots_dir);
+
+        assert_eq!(info.recording_name, "test");
+        assert_eq!(info.total_screenshots, 3);
+        assert_eq!(info.ocr_count, 1);
+        assert_eq!(info.vision_count, 1);
+        assert_eq!(info.edited_count, 1);
+        assert_eq!(info.analyses[0].tier, "ocr");
+        assert_eq!(info.analyses[1].tier, "vision");
+        assert_eq!(info.analyses[2].tier, "edited");
+        assert!(info.analyses[2].user_edited);
+        assert!(info.analyses[0].image_path.contains("0000.jpg"));
     }
 }

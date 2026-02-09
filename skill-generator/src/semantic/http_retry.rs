@@ -36,10 +36,14 @@ where
                     response = Some(resp);
                     break;
                 } else if status == StatusCode::TOO_MANY_REQUESTS {
+                    // Longer backoff for rate limiting (4s, 8s, 16s) since the API
+                    // needs time to reset the request quota
                     let delay = std::time::Duration::from_secs(2u64.pow(attempt + 1));
                     warn!("{}: rate limited (429), retrying in {:?}", context, delay);
                     tokio::time::sleep(delay).await;
                 } else if status.is_server_error() {
+                    // Shorter backoff for server errors (1s, 2s, 4s) which are
+                    // typically transient and resolve faster
                     let delay = std::time::Duration::from_secs(2u64.pow(attempt));
                     warn!("{}: server error ({}), retrying in {:?}", context, status, delay);
                     tokio::time::sleep(delay).await;

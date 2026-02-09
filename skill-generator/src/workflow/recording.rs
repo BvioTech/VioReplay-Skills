@@ -9,7 +9,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 /// Current recording format version
-pub const CURRENT_FORMAT_VERSION: &str = "1.0";
+pub const CURRENT_FORMAT_VERSION: &str = "2.0";
 
 /// Checkpoint interval: save every N events
 pub const CHECKPOINT_INTERVAL: usize = 100;
@@ -41,6 +41,9 @@ pub struct RecordingMetadata {
     pub duration_ms: u64,
     /// Version of the recording format
     pub format_version: String,
+    /// Whether this recording has associated screenshots
+    #[serde(default)]
+    pub has_screenshots: bool,
 }
 
 impl RecordingMetadata {
@@ -56,6 +59,7 @@ impl RecordingMetadata {
             event_count: 0,
             duration_ms: 0,
             format_version: CURRENT_FORMAT_VERSION.to_string(),
+            has_screenshots: false,
         }
     }
 
@@ -79,6 +83,7 @@ impl Default for RecordingMetadata {
             event_count: 0,
             duration_ms: 0,
             format_version: CURRENT_FORMAT_VERSION.to_string(),
+            has_screenshots: false,
         }
     }
 }
@@ -179,6 +184,50 @@ impl Recording {
             }
         }
         recovered
+    }
+
+    /// Save recording in directory format: `{base_dir}/{name}/recording.json`
+    ///
+    /// Creates the directory structure and screenshots subdirectory.
+    /// Returns the path to the recording directory.
+    pub fn save_to_dir(&self, base_dir: &Path) -> crate::Result<std::path::PathBuf> {
+        let dir = base_dir.join(&self.metadata.name);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(dir.join("screenshots"))?;
+        let json_path = dir.join("recording.json");
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(&json_path, json)?;
+        Ok(dir)
+    }
+
+    /// Load a recording by name, checking both directory format and flat file format.
+    ///
+    /// Checks in order:
+    /// 1. `{base_dir}/{name}/recording.json` (new directory format)
+    /// 2. `{base_dir}/{name}.json` (old flat format)
+    pub fn load_auto(base_dir: &Path, name: &str) -> crate::Result<Self> {
+        let dir_path = base_dir.join(name).join("recording.json");
+        if dir_path.exists() {
+            return Self::load(&dir_path);
+        }
+        let flat_path = base_dir.join(format!("{}.json", name));
+        if flat_path.exists() {
+            return Self::load(&flat_path);
+        }
+        Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Recording '{}' not found in either format", name),
+        )))
+    }
+
+    /// Get the recording directory path for a given base directory and name.
+    pub fn recording_dir(base_dir: &Path, name: &str) -> std::path::PathBuf {
+        base_dir.join(name)
+    }
+
+    /// Get the screenshots subdirectory path for a given recording directory.
+    pub fn screenshots_dir(recording_dir: &Path) -> std::path::PathBuf {
+        recording_dir.join("screenshots")
     }
 
     /// Load recording from a file.
@@ -332,7 +381,7 @@ mod tests {
         assert!(metadata.ended_at.is_none());
         assert_eq!(metadata.event_count, 0);
         assert_eq!(metadata.duration_ms, 0);
-        assert_eq!(metadata.format_version, "1.0");
+        assert_eq!(metadata.format_version, "2.0");
     }
 
     #[test]
@@ -726,8 +775,142 @@ mod tests {
 
     #[test]
     fn test_current_format_version_constant() {
-        assert_eq!(CURRENT_FORMAT_VERSION, "1.0");
+        assert_eq!(CURRENT_FORMAT_VERSION, "2.0");
         let meta = RecordingMetadata::new("test".to_string(), None);
         assert_eq!(meta.format_version, CURRENT_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn test_has_screenshots_default_false() {
+        let meta = RecordingMetadata::new("test".to_string(), None);
+        assert!(!meta.has_screenshots);
+    }
+
+    #[test]
+    fn test_has_screenshots_serde_default() {
+        // Old format without has_screenshots field
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "old_recording",
+            "goal": null,
+            "started_at": "2025-01-01T00:00:00Z",
+            "ended_at": null,
+            "event_count": 0,
+            "duration_ms": 0,
+            "format_version": "1.0"
+        }"#;
+        let meta: RecordingMetadata = serde_json::from_str(json).unwrap();
+        assert!(!meta.has_screenshots, "Missing has_screenshots should default to false");
+    }
+
+    #[test]
+    fn test_save_to_dir_and_load_auto() {
+        MachTimebase::init();
+        let dir = tempfile::tempdir().unwrap();
+        let mut recording = Recording::new("dir_test".to_string(), Some("Test dir format".to_string()));
+        recording.add_raw_event(make_test_raw_event(EventType::LeftMouseDown, 10.0, 20.0));
+        recording.finalize(1000);
+
+        // Save in directory format
+        let rec_dir = recording.save_to_dir(dir.path()).unwrap();
+        assert!(rec_dir.join("recording.json").exists());
+        assert!(rec_dir.join("screenshots").exists());
+
+        // Load via load_auto (should find directory format)
+        let loaded = Recording::load_auto(dir.path(), "dir_test").unwrap();
+        assert_eq!(loaded.metadata.name, "dir_test");
+        assert_eq!(loaded.len(), 1);
+    }
+
+    #[test]
+    fn test_load_auto_falls_back_to_flat() {
+        MachTimebase::init();
+        let dir = tempfile::tempdir().unwrap();
+        let recording = Recording::new("flat_test".to_string(), None);
+
+        // Save in old flat format
+        let flat_path = dir.path().join("flat_test.json");
+        recording.save(&flat_path).unwrap();
+
+        // load_auto should find the flat file
+        let loaded = Recording::load_auto(dir.path(), "flat_test").unwrap();
+        assert_eq!(loaded.metadata.name, "flat_test");
+    }
+
+    #[test]
+    fn test_load_auto_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = Recording::load_auto(dir.path(), "nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_recording_dir_helper() {
+        let base = Path::new("/tmp/recordings");
+        let dir = Recording::recording_dir(base, "my-recording");
+        assert_eq!(dir, Path::new("/tmp/recordings/my-recording"));
+    }
+
+    #[test]
+    fn test_screenshots_dir_helper() {
+        let rec_dir = Path::new("/tmp/recordings/my-recording");
+        let ss_dir = Recording::screenshots_dir(rec_dir);
+        assert_eq!(ss_dir, Path::new("/tmp/recordings/my-recording/screenshots"));
+    }
+
+    #[test]
+    fn test_screenshot_filename_on_enriched_event() {
+        MachTimebase::init();
+        let mut recording = Recording::new("ss_test".to_string(), None);
+        let raw = make_test_raw_event(EventType::LeftMouseDown, 100.0, 200.0);
+        recording.add_raw_event(raw);
+        recording.events[0].screenshot_filename = Some("0000.jpg".to_string());
+
+        let json = serde_json::to_string(&recording).unwrap();
+        let loaded: Recording = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.events[0].screenshot_filename,
+            Some("0000.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn test_screenshot_filename_absent_in_old_events() {
+        // Old format without screenshot_filename
+        let json = r#"{
+            "raw": {
+                "timestamp": 1000,
+                "event_type": "LeftMouseDown",
+                "coordinates": [100.0, 200.0],
+                "cursor_state": "Arrow",
+                "key_code": null,
+                "character": null,
+                "modifiers": {"shift": false, "control": false, "option": false, "command": false, "caps_lock": false, "function": false},
+                "scroll_delta": null,
+                "click_count": 1
+            },
+            "id": "00000000-0000-0000-0000-000000000042"
+        }"#;
+        let event: EnrichedEvent = serde_json::from_str(json).unwrap();
+        assert!(event.screenshot_filename.is_none());
+    }
+
+    #[test]
+    fn test_dir_format_roundtrip() {
+        MachTimebase::init();
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut recording = Recording::new("roundtrip_test".to_string(), Some("Roundtrip".to_string()));
+        recording.metadata.has_screenshots = true;
+        recording.add_raw_event(make_test_raw_event(EventType::LeftMouseDown, 10.0, 20.0));
+        recording.events[0].screenshot_filename = Some("0000.jpg".to_string());
+        recording.finalize(500);
+
+        recording.save_to_dir(dir.path()).unwrap();
+
+        let loaded = Recording::load_auto(dir.path(), "roundtrip_test").unwrap();
+        assert!(loaded.metadata.has_screenshots);
+        assert_eq!(loaded.events[0].screenshot_filename, Some("0000.jpg".to_string()));
+        assert_eq!(loaded.metadata.duration_ms, 500);
     }
 }

@@ -68,6 +68,8 @@ pub struct GeneratorConfig {
     pub use_goms_detection: bool,
     /// Use ContextStack to track window/app context changes during generation
     pub use_context_tracking: bool,
+    /// Screenshot analysis intents to overlay onto steps (sequence → intent)
+    pub screenshot_analysis: Option<Vec<(u64, String)>>,
 }
 
 impl Default for GeneratorConfig {
@@ -86,6 +88,7 @@ impl Default for GeneratorConfig {
             use_trajectory_analysis: true,
             use_goms_detection: true,
             use_context_tracking: true,
+            screenshot_analysis: None,
         }
     }
 }
@@ -347,7 +350,17 @@ impl SkillGenerator {
             steps_with_selectors
         };
 
-        stats.generated_steps_count = steps_with_verification.len();
+        // Step 6b: Overlay screenshot analysis intents onto steps
+        let mut steps_final = steps_with_verification;
+        if let Some(ref analysis) = self.config.screenshot_analysis {
+            let enhanced = self.overlay_screenshot_intents(&mut steps_final, analysis, &enriched_recording);
+            stats.screenshot_enhanced_count = enhanced;
+            if enhanced > 0 {
+                info!(count = enhanced, "Enhanced steps with screenshot analysis intents");
+            }
+        }
+
+        stats.generated_steps_count = steps_final.len();
 
         // Step 7: Build the skill
         let skill = GeneratedSkill {
@@ -358,7 +371,7 @@ impl SkillGenerator {
             context: "fork".to_string(),
             allowed_tools: vec!["Read".to_string(), "Bash".to_string()],
             variables: variables.clone(),
-            steps: steps_with_verification,
+            steps: steps_final,
             source_recording_id: recording.metadata.id,
             stats,
         };
@@ -1134,12 +1147,11 @@ impl SkillGenerator {
                 .cloned()
                 .collect();
 
-            // Collect source event indices (using the event sequence numbers)
+            // Collect source event indices (recording-level indices, not task-local)
             let source_events: Vec<usize> = task
                 .events
                 .iter()
-                .enumerate()
-                .map(|(i, _)| i)
+                .map(|e| e.sequence as usize)
                 .collect();
 
             steps.push(GeneratedStep {
@@ -1156,6 +1168,109 @@ impl SkillGenerator {
         }
 
         steps
+    }
+
+    /// Overlay screenshot analysis intents onto generated steps.
+    ///
+    /// Three-pass matching:
+    /// 1. Exact match: checks if any source event has a screenshot intent
+    /// 2. Range match: finds the closest intent within the step's event range
+    /// 3. Proximity match: assigns nearest unused intent by sequence distance
+    ///
+    /// Pass 3 handles the common case where screenshot events get dropped by
+    /// the ActionClusterer (e.g., single-event clusters below min_events threshold).
+    fn overlay_screenshot_intents(
+        &self,
+        steps: &mut [GeneratedStep],
+        analysis: &[(u64, String)],
+        _recording: &Recording,
+    ) -> usize {
+        if analysis.is_empty() || steps.is_empty() {
+            return 0;
+        }
+
+        let mut enhanced = 0;
+        let mut used_intents: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+        // Pass 1: Exact match — source_events directly contain a screenshot event
+        for step in steps.iter_mut() {
+            for (seq, intent) in analysis {
+                if !intent.is_empty() && step.source_events.contains(&(*seq as usize)) {
+                    step.description = intent.clone();
+                    used_intents.insert(*seq);
+                    enhanced += 1;
+                    break;
+                }
+            }
+        }
+
+        // Pass 2: Range match — find intent within step's event sequence range
+        for step in steps.iter_mut() {
+            if used_intents.iter().any(|seq| step.source_events.contains(&(*seq as usize))) {
+                continue; // Already matched in Pass 1
+            }
+            if step.source_events.is_empty() {
+                continue;
+            }
+
+            let min_seq = step.source_events.iter().copied().min().unwrap_or(0) as u64;
+            let max_seq = step.source_events.iter().copied().max().unwrap_or(0) as u64;
+
+            if let Some((seq, intent)) = analysis.iter()
+                .filter(|(seq, intent)| {
+                    *seq >= min_seq && *seq <= max_seq
+                        && !intent.is_empty()
+                        && !used_intents.contains(seq)
+                })
+                .last()
+            {
+                step.description = intent.clone();
+                used_intents.insert(*seq);
+                enhanced += 1;
+            }
+        }
+
+        // Pass 3: Proximity match — assign nearest unused intent to unmatched steps
+        // This handles screenshot events that were dropped by the clusterer
+        if used_intents.len() < analysis.len() {
+            let unused_intents: Vec<(u64, &str)> = analysis.iter()
+                .filter(|(seq, intent)| !intent.is_empty() && !used_intents.contains(seq))
+                .map(|(seq, intent)| (*seq, intent.as_str()))
+                .collect();
+
+            for intent_entry in &unused_intents {
+                let (intent_seq, intent_text) = intent_entry;
+
+                // Find the step whose midpoint is closest to this intent's sequence
+                let best_step = steps.iter_mut()
+                    .filter(|s| {
+                        // Skip steps that already have an intent from Pass 1/2
+                        !used_intents.iter().any(|seq| s.source_events.contains(&(*seq as usize)))
+                    })
+                    .min_by_key(|s| {
+                        if s.source_events.is_empty() {
+                            return u64::MAX;
+                        }
+                        let mid = (s.source_events.iter().copied().min().unwrap_or(0)
+                            + s.source_events.iter().copied().max().unwrap_or(0)) as u64 / 2;
+                        mid.abs_diff(*intent_seq)
+                    });
+
+                if let Some(step) = best_step {
+                    step.description = intent_text.to_string();
+                    used_intents.insert(*intent_seq);
+                    enhanced += 1;
+                }
+            }
+        }
+
+        info!(
+            enhanced = enhanced,
+            total_steps = steps.len(),
+            available_intents = analysis.len(),
+            "Screenshot intent overlay complete"
+        );
+        enhanced
     }
 
     /// Generate human-readable step description
@@ -1207,7 +1322,8 @@ impl SkillGenerator {
         }
     }
 
-    /// Get target description from event for use in step descriptions
+    /// Get target description from event for use in step descriptions.
+    /// Falls through increasingly generic descriptions: title > role+id > role > parent context > coordinates.
     fn get_target_description(&self, event: &EnrichedEvent) -> String {
         if let Some(ref semantic) = event.semantic {
             if let Some(ref title) = semantic.title {
@@ -1219,7 +1335,29 @@ impl SkillGenerator {
                 if let Some(ref id) = semantic.identifier {
                     return format!("{} ({})", role, id);
                 }
+                // Role + parent context is more useful than role alone
+                if let Some(ref parent) = semantic.parent_title {
+                    if !parent.is_empty() {
+                        return format!("{} in \"{}\"", role, parent);
+                    }
+                }
                 return role.clone();
+            }
+            // No role but has parent/window context
+            if let Some(ref parent) = semantic.parent_title {
+                if !parent.is_empty() {
+                    return format!("element in \"{}\"", parent);
+                }
+            }
+            if let Some(ref window) = semantic.window_title {
+                if !window.is_empty() {
+                    return format!("element in window \"{}\"", window);
+                }
+            }
+            if let Some(ref app) = semantic.app_name {
+                if !app.is_empty() {
+                    return format!("element in {}", app);
+                }
             }
         }
         format!("({:.0}, {:.0})", event.raw.coordinates.0, event.raw.coordinates.1)
@@ -1598,6 +1736,8 @@ pub struct PipelineStats {
     pub noise_filtered_count: usize,
     /// Total generated steps
     pub generated_steps_count: usize,
+    /// Number of steps enhanced with screenshot analysis intents
+    pub screenshot_enhanced_count: usize,
     /// Pipeline warnings (partial failures, fallbacks)
     pub warnings: Vec<String>,
 }
@@ -3131,5 +3271,215 @@ mod tests {
         // The pipeline ran successfully with the noise filter active
         // (exact noise_filtered_count depends on what other noise the pipeline produces)
         assert!(skill.stats.generated_steps_count <= 2, "should have at most 2 steps after filtering");
+    }
+
+    // --- overlay_screenshot_intents tests ---
+
+    #[test]
+    fn test_overlay_screenshot_intents_empty_analysis() {
+        let generator = SkillGenerator::new();
+        let recording = Recording::new("test".to_string(), None);
+        let analysis: Vec<(u64, String)> = vec![];
+        let mut steps = vec![
+            make_step(1, Action::Unknown { description: "original".into(), confidence: 0.9 }, 0.9),
+        ];
+        let enhanced = generator.overlay_screenshot_intents(&mut steps, &analysis, &recording);
+        assert_eq!(enhanced, 0);
+        assert_eq!(steps[0].description, "Step 1");
+    }
+
+    #[test]
+    fn test_overlay_screenshot_intents_no_matching_events_uses_proximity() {
+        MachTimebase::init();
+        let generator = SkillGenerator::new();
+        let mut recording = Recording::new("test".to_string(), None);
+
+        let event = make_test_event(EventType::LeftMouseDown, 100.0, 200.0);
+        recording.add_event(event); // sequence 0
+
+        // Analysis references sequence 99 which doesn't exist in source_events,
+        // but proximity matching (Pass 3) should still assign it to the nearest step
+        let analysis = vec![(99, "Click the submit button".to_string())];
+        let mut steps = vec![
+            make_step(0, Action::Unknown { description: "original".into(), confidence: 0.9 }, 0.9),
+        ];
+        let enhanced = generator.overlay_screenshot_intents(&mut steps, &analysis, &recording);
+        assert_eq!(enhanced, 1);
+        assert_eq!(steps[0].description, "Click the submit button");
+    }
+
+    #[test]
+    fn test_overlay_screenshot_intents_successful_overlay() {
+        MachTimebase::init();
+        let generator = SkillGenerator::new();
+        let mut recording = Recording::new("test".to_string(), None);
+
+        let event = make_test_event(EventType::LeftMouseDown, 100.0, 200.0);
+        let seq = event.sequence;
+        recording.add_event(event);
+
+        let analysis = vec![(seq, "Click the Save button in the toolbar".to_string())];
+        let mut steps = vec![
+            make_step(0, Action::Unknown { description: "original".into(), confidence: 0.9 }, 0.9),
+        ];
+        // source_events[0] = step.number = 0 which is the event index
+        let enhanced = generator.overlay_screenshot_intents(&mut steps, &analysis, &recording);
+        assert_eq!(enhanced, 1);
+        assert_eq!(steps[0].description, "Click the Save button in the toolbar");
+    }
+
+    #[test]
+    fn test_overlay_screenshot_intents_empty_intent_skipped() {
+        MachTimebase::init();
+        let generator = SkillGenerator::new();
+        let mut recording = Recording::new("test".to_string(), None);
+
+        let event = make_test_event(EventType::LeftMouseDown, 100.0, 200.0);
+        let seq = event.sequence;
+        recording.add_event(event);
+
+        // Empty intent string should NOT replace the step description
+        let analysis = vec![(seq, "".to_string())];
+        let mut steps = vec![
+            make_step(0, Action::Unknown { description: "original".into(), confidence: 0.9 }, 0.9),
+        ];
+        let enhanced = generator.overlay_screenshot_intents(&mut steps, &analysis, &recording);
+        assert_eq!(enhanced, 0);
+        assert_eq!(steps[0].description, "Step 0");
+    }
+
+    #[test]
+    fn test_overlay_screenshot_intents_multiple_steps() {
+        MachTimebase::init();
+        let generator = SkillGenerator::new();
+        let mut recording = Recording::new("test".to_string(), None);
+
+        // Use add_raw_event to get correct sequence numbers (0, 1)
+        recording.add_raw_event(crate::capture::types::RawEvent {
+            timestamp: Timestamp::now(),
+            event_type: EventType::LeftMouseDown,
+            coordinates: (100.0, 200.0),
+            cursor_state: CursorState::Arrow,
+            key_code: None,
+            character: None,
+            modifiers: ModifierFlags::default(),
+            scroll_delta: None,
+            click_count: 1,
+        });
+        recording.add_raw_event(crate::capture::types::RawEvent {
+            timestamp: Timestamp::now(),
+            event_type: EventType::KeyDown,
+            coordinates: (0.0, 0.0),
+            cursor_state: CursorState::Arrow,
+            key_code: None,
+            character: Some('a'),
+            modifiers: ModifierFlags::default(),
+            scroll_delta: None,
+            click_count: 0,
+        });
+
+        // Only event with sequence 0 has a matching intent
+        let analysis = vec![
+            (0, "Click File menu".to_string()),
+            // sequence 1 not included - step 1 should keep its original description
+        ];
+        let mut steps = vec![
+            make_step(0, Action::Unknown { description: "original".into(), confidence: 0.9 }, 0.9),
+            make_step(1, Action::Unknown { description: "original".into(), confidence: 0.9 }, 0.9),
+        ];
+        let enhanced = generator.overlay_screenshot_intents(&mut steps, &analysis, &recording);
+        assert_eq!(enhanced, 1);
+        assert_eq!(steps[0].description, "Click File menu");
+        assert_eq!(steps[1].description, "Step 1"); // unchanged
+    }
+
+    #[test]
+    fn test_overlay_screenshot_intents_out_of_bounds_uses_proximity() {
+        MachTimebase::init();
+        let generator = SkillGenerator::new();
+        let recording = Recording::new("test".to_string(), None);
+        // Recording has 0 events, but step references event index 5
+        // Proximity matching (Pass 3) assigns the intent to the nearest step
+
+        let analysis = vec![(0, "Some intent".to_string())];
+        let mut steps = vec![GeneratedStep {
+            number: 1,
+            description: "Original".to_string(),
+            action: Action::Unknown { description: "test".into(), confidence: 0.9 },
+            selector: None,
+            fallback_selectors: Vec::new(),
+            variables: Vec::new(),
+            verification: None,
+            source_events: vec![5], // Out of bounds, but proximity match still works
+            confidence: 0.9,
+        }];
+        let enhanced = generator.overlay_screenshot_intents(&mut steps, &analysis, &recording);
+        assert_eq!(enhanced, 1);
+        assert_eq!(steps[0].description, "Some intent");
+    }
+
+    #[test]
+    fn test_generate_with_screenshot_analysis() {
+        MachTimebase::init();
+        let mut recording = Recording::new("test".to_string(), Some("Test clicks".to_string()));
+
+        let mut event = make_test_event(EventType::LeftMouseDown, 100.0, 200.0);
+        event.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".into()),
+            title: Some("Submit".into()),
+            ..Default::default()
+        });
+        let seq = event.sequence;
+        recording.add_event(event);
+
+        let config = GeneratorConfig {
+            use_action_clustering: false,
+            use_local_recovery: false,
+            use_vision_ocr: false,
+            use_trajectory_analysis: false,
+            use_goms_detection: false,
+            use_context_tracking: false,
+            use_llm_semantic: false,
+            screenshot_analysis: Some(vec![(seq, "Click the Submit button to send the form".to_string())]),
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let skill = generator.generate(&recording).unwrap();
+
+        assert!(!skill.steps.is_empty());
+        assert_eq!(skill.steps[0].description, "Click the Submit button to send the form");
+        assert_eq!(skill.stats.screenshot_enhanced_count, 1);
+    }
+
+    #[test]
+    fn test_generate_without_screenshot_analysis_uses_default() {
+        MachTimebase::init();
+        let mut recording = Recording::new("test".to_string(), Some("Test clicks".to_string()));
+
+        let mut event = make_test_event(EventType::LeftMouseDown, 100.0, 200.0);
+        event.semantic = Some(SemanticContext {
+            ax_role: Some("AXButton".into()),
+            title: Some("Submit".into()),
+            ..Default::default()
+        });
+        recording.add_event(event);
+
+        let config = GeneratorConfig {
+            use_action_clustering: false,
+            use_local_recovery: false,
+            use_vision_ocr: false,
+            use_trajectory_analysis: false,
+            use_goms_detection: false,
+            use_context_tracking: false,
+            use_llm_semantic: false,
+            screenshot_analysis: None,
+            ..Default::default()
+        };
+        let generator = SkillGenerator::with_config(config);
+        let skill = generator.generate(&recording).unwrap();
+
+        assert!(!skill.steps.is_empty());
+        assert!(skill.steps[0].description.contains("Submit"));
+        assert_eq!(skill.stats.screenshot_enhanced_count, 0);
     }
 }

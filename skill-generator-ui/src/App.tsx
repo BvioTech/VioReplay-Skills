@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, Component } from "react";
 import type { ReactNode, ErrorInfo } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import "./App.css";
 
 interface RecordingStatus {
@@ -18,6 +18,27 @@ interface RecordingInfo {
   duration_ms: number;
   created_at: string;
   goal: string | null;
+  has_screenshots: boolean;
+  has_analysis: boolean;
+}
+
+interface ScreenshotAnalysisInfo {
+  sequence: number;
+  filename: string;
+  intent: string;
+  confidence: number;
+  tier: string;
+  user_edited: boolean;
+  image_path: string;
+}
+
+interface AnalysisInfo {
+  recording_name: string;
+  analyses: ScreenshotAnalysisInfo[];
+  total_screenshots: number;
+  ocr_count: number;
+  vision_count: number;
+  edited_count: number;
 }
 
 interface PipelineStatsInfo {
@@ -31,6 +52,7 @@ interface PipelineStatsInfo {
   noise_filtered_count: number;
   variables_count: number;
   generated_steps_count: number;
+  screenshot_enhanced_count: number;
   warnings: string[];
 }
 
@@ -47,6 +69,7 @@ interface UiConfig {
   hesitation_threshold: number;
   min_pause_ms: number;
   model: string;
+  vision_model: string;
   temperature: number;
   use_action_clustering: boolean;
   use_local_recovery: boolean;
@@ -54,7 +77,14 @@ interface UiConfig {
   use_trajectory_analysis: boolean;
   use_goms_detection: boolean;
   use_context_tracking: boolean;
+  capture_screenshots: boolean;
 }
+
+const MODEL_OPTIONS = [
+  { value: "claude-opus-4-6", label: "Claude Opus 4.6" },
+  { value: "claude-sonnet-4-5-20250929", label: "Claude Sonnet 4.5" },
+  { value: "claude-haiku-4-5-20250929", label: "Claude Haiku 4.5" },
+];
 
 interface SkillListEntry {
   name: string;
@@ -116,7 +146,7 @@ function MarkdownPreview({ content }: { content: string }) {
 
     // Code block
     if (line.startsWith("```")) {
-      const lang = line.slice(3).trim();
+      const lang = line.slice(3).trim().replace(/[^a-zA-Z0-9_-]/g, "");
       const codeLines: string[] = [];
       i++;
       while (i < lines.length && !lines[i].startsWith("```")) {
@@ -274,11 +304,20 @@ function App() {
   // Pipeline stats
   const [pipelineStats, setPipelineStats] = useState<PipelineStatsInfo | null>(null);
 
+  // Screenshot review state
+  const [reviewingRecording, setReviewingRecording] = useState<string | null>(null);
+  const [analysisData, setAnalysisData] = useState<AnalysisInfo | null>(null);
+  const [analyzing, setAnalyzing] = useState<string | null>(null);
+  const [selectedScreenshot, setSelectedScreenshot] = useState<ScreenshotAnalysisInfo | null>(null);
+
   // Config state
   const [config, setConfig] = useState<UiConfig | null>(null);
 
   // Timer ref
   const timerRef = useRef<number | null>(null);
+
+  // Debounce timers for intent IPC persistence (keyed by sequence number)
+  const intentDebounceRef = useRef<Record<number, number>>({});
 
   // Check permissions and load recordings on mount
   useEffect(() => {
@@ -337,22 +376,6 @@ function App() {
       lastEventCountRef.current = 0;
     }
   }, [eventCount, isRecording]);
-
-  // Keyboard shortcuts
-  useEffect(() => {
-    function handleKeyDown(e: KeyboardEvent) {
-      if (e.metaKey && e.key === "r" && !isRecording && hasAccessibility) {
-        e.preventDefault();
-        handleStartRecording();
-      }
-      if (e.key === "Escape" && isRecording) {
-        e.preventDefault();
-        handleStopRecording();
-      }
-    }
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isRecording, hasAccessibility, recordingName, goal]);
 
   async function checkStatus() {
     try {
@@ -447,6 +470,26 @@ function App() {
     }
   }, []);
 
+  // Keyboard shortcuts
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.metaKey && e.key === "r" && !isRecording && hasAccessibility) {
+        e.preventDefault();
+        handleStartRecording();
+      }
+      if (e.key === "Escape" && isRecording) {
+        e.preventDefault();
+        handleStopRecording();
+      }
+      if (e.key === "Escape" && selectedScreenshot) {
+        e.preventDefault();
+        setSelectedScreenshot(null);
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isRecording, hasAccessibility, selectedScreenshot, handleStartRecording, handleStopRecording]);
+
   async function handleGenerateSkill(recordingPath: string) {
     setError(null);
     setSuccess(null);
@@ -498,7 +541,8 @@ function App() {
     if (c.hesitation_threshold < 0 || c.hesitation_threshold > 1) return "Hesitation threshold must be between 0 and 1";
     if (c.min_pause_ms === 0) return "Min pause must be greater than 0";
     if (c.temperature < 0 || c.temperature > 2) return "Temperature must be between 0 and 2";
-    if (!c.model || c.model.trim() === "") return "Model name cannot be empty";
+    if (!c.model || c.model.trim() === "") return "Inference model cannot be empty";
+    if (!c.vision_model || c.vision_model.trim() === "") return "Vision model cannot be empty";
     return null;
   }
 
@@ -546,6 +590,23 @@ function App() {
     try {
       await invoke("delete_recording", { name });
       setRecordings((prev) => prev.filter((r) => r.name !== name));
+      // Clear any UI state tied to the deleted recording
+      if (reviewingRecording === name) {
+        setReviewingRecording(null);
+        setAnalysisData(null);
+        setSelectedScreenshot(null);
+      }
+      setGeneratedSkills((prev) => {
+        const next = { ...prev };
+        for (const key of Object.keys(next)) {
+          if (key.includes(name)) delete next[key];
+        }
+        return next;
+      });
+      if (skillPreviewName && skillPreviewName.includes(name)) {
+        setSkillPreviewContent(null);
+        setSkillPreviewName(null);
+      }
       setSuccess(`Deleted recording: ${name}`);
     } catch (e: unknown) {
       const errorMsg = e instanceof Error ? e.message : String(e);
@@ -666,6 +727,89 @@ function App() {
     }
   }
 
+  async function handleAnalyzeRecording(recordingName: string) {
+    setError(null);
+    setSuccess(null);
+    setAnalyzing(recordingName);
+    try {
+      const result = await invoke<AnalysisInfo>("analyze_recording", { recordingName });
+      setAnalysisData(result);
+      setReviewingRecording(recordingName);
+      setSuccess(`Analysis complete: ${result.total_screenshots} screenshots (${result.ocr_count} OCR, ${result.vision_count} Vision)`);
+      await loadRecordings();
+    } catch (e: unknown) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      setError(`Analysis failed: ${errorMsg}`);
+    } finally {
+      setAnalyzing(null);
+    }
+  }
+
+  async function handleOpenReview(recordingName: string) {
+    setError(null);
+    try {
+      const result = await invoke<AnalysisInfo | null>("get_analysis", { recordingName });
+      if (result) {
+        setAnalysisData(result);
+        setReviewingRecording(recordingName);
+      } else {
+        setError("No analysis found. Run analysis first.");
+      }
+    } catch (e: unknown) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      setError(`Failed to load analysis: ${errorMsg}`);
+    }
+  }
+
+  function handleUpdateIntent(sequence: number, newIntent: string) {
+    if (!reviewingRecording) return;
+    const recordingName = reviewingRecording;
+
+    // Update local state immediately for responsive UI
+    setAnalysisData(prev => {
+      if (!prev) return prev;
+      const updatedAnalyses = prev.analyses.map(a =>
+        a.sequence === sequence
+          ? { ...a, intent: newIntent, user_edited: true, tier: "edited" }
+          : a
+      );
+      return {
+        ...prev,
+        analyses: updatedAnalyses,
+        edited_count: updatedAnalyses.filter(a => a.user_edited).length,
+      };
+    });
+
+    // Debounce the IPC persistence call (500ms)
+    if (intentDebounceRef.current[sequence]) {
+      clearTimeout(intentDebounceRef.current[sequence]);
+    }
+    intentDebounceRef.current[sequence] = window.setTimeout(async () => {
+      delete intentDebounceRef.current[sequence];
+      try {
+        await invoke("update_intent", {
+          recordingName,
+          sequence,
+          newIntent,
+        });
+      } catch (e: unknown) {
+        const errorMsg = e instanceof Error ? e.message : String(e);
+        setError(`Failed to save intent: ${errorMsg}`);
+      }
+    }, 500);
+  }
+
+  function handleCloseReview() {
+    // Clear any pending debounced IPC calls
+    for (const timer of Object.values(intentDebounceRef.current)) {
+      clearTimeout(timer);
+    }
+    intentDebounceRef.current = {};
+    setReviewingRecording(null);
+    setAnalysisData(null);
+    setSelectedScreenshot(null);
+  }
+
   function formatSkillSize(bytes: number): string {
     if (bytes < 1024) return `${bytes} B`;
     return `${(bytes / 1024).toFixed(1)} KB`;
@@ -747,6 +891,21 @@ function App() {
           Settings
         </button>
       </nav>
+
+      {/* Loading Overlay */}
+      {(analyzing || generating) && (
+        <div className="loading-overlay" role="status" aria-live="assertive">
+          <div className="loading-card">
+            <div className="loading-spinner" />
+            <div className="loading-text">
+              {analyzing ? "Analyzing screenshots..." : "Generating skill..."}
+            </div>
+            <div className="loading-hint">
+              {analyzing ? "Running OCR and AI analysis" : "Processing events and building SKILL.md"}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Alerts */}
       <div className="alerts" aria-live="polite">
@@ -878,79 +1037,128 @@ function App() {
             </section>
           )}
 
-          {/* Pipeline Stats */}
+          {/* Pipeline Stats — compact inline summary */}
           {pipelineStats && (
-            <section className="panel stats-panel">
+            <div className="stats-bar">
+              <span className="stats-bar-summary">
+                {pipelineStats.generated_steps_count} steps
+                {pipelineStats.variables_count > 0 && ` / ${pipelineStats.variables_count} vars`}
+                {pipelineStats.screenshot_enhanced_count > 0 && ` / ${pipelineStats.screenshot_enhanced_count} enhanced`}
+                {pipelineStats.warnings.length > 0 && ` / ${pipelineStats.warnings.length} warnings`}
+              </span>
+              <button className="btn btn-tiny" onClick={() => setPipelineStats(null)}>Dismiss</button>
+            </div>
+          )}
+
+          {/* Screenshot Review */}
+          {reviewingRecording && analysisData && (
+            <section className="panel screenshot-review-panel">
               <div className="preview-header">
-                <h2 className="panel-title">Pipeline Statistics</h2>
+                <h2 className="panel-title">Review: {reviewingRecording}</h2>
+                <div className="preview-actions">
+                  <span className="review-stats">
+                    {analysisData.total_screenshots} screenshots
+                    {analysisData.ocr_count > 0 && ` / ${analysisData.ocr_count} OCR`}
+                    {analysisData.vision_count > 0 && ` / ${analysisData.vision_count} Vision`}
+                    {analysisData.edited_count > 0 && ` / ${analysisData.edited_count} edited`}
+                  </span>
+                  <button
+                    className="btn btn-generate"
+                    onClick={() => {
+                      const rec = recordings.find(r => r.name === reviewingRecording);
+                      if (rec) {
+                        handleCloseReview();
+                        handleGenerateSkill(rec.path);
+                      }
+                    }}
+                  >
+                    Accept All & Generate
+                  </button>
+                  <button className="btn btn-small" onClick={handleCloseReview} aria-label="Close review">
+                    Close
+                  </button>
+                </div>
+              </div>
+              <div className="screenshot-grid" role="list" aria-label="Screenshot analysis">
+                {analysisData.analyses.map((item) => (
+                  <div
+                    key={item.sequence}
+                    className="screenshot-row"
+                    role="listitem"
+                  >
+                    <button
+                      className="screenshot-thumb-btn"
+                      onClick={() => setSelectedScreenshot(item)}
+                      aria-label={`Screenshot ${item.sequence}: ${item.intent}`}
+                    >
+                      <img
+                        className="screenshot-thumb"
+                        src={convertFileSrc(item.image_path)}
+                        alt={`Screenshot ${item.sequence}`}
+                        loading="lazy"
+                      />
+                    </button>
+                    <div className="screenshot-row-content">
+                      <div className="screenshot-card-meta">
+                        <span className="screenshot-seq">#{item.sequence}</span>
+                        <span className={`tier-badge tier-${item.tier}`}>
+                          {item.tier === "ocr" ? "OCR" : item.tier === "vision" ? "Vision" : "Edited"}
+                        </span>
+                        {item.user_edited && <span className="edited-badge">Edited</span>}
+                      </div>
+                      <textarea
+                        className="intent-editor"
+                        value={item.intent}
+                        onChange={(e) => handleUpdateIntent(item.sequence, e.target.value)}
+                        aria-label={`Intent for screenshot ${item.sequence}`}
+                        rows={3}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* Screenshot Modal */}
+          {selectedScreenshot && (
+            <div
+              className="screenshot-modal"
+              onClick={() => setSelectedScreenshot(null)}
+              onKeyDown={(e) => { if (e.key === "Escape") setSelectedScreenshot(null); }}
+              role="dialog"
+              aria-label="Screenshot preview"
+              tabIndex={-1}
+            >
+              <div className="screenshot-modal-content" onClick={(e) => e.stopPropagation()}>
+                <img
+                  src={convertFileSrc(selectedScreenshot.image_path)}
+                  alt={`Screenshot ${selectedScreenshot.sequence}`}
+                />
+                <div className="screenshot-modal-info">
+                  <strong>#{selectedScreenshot.sequence}</strong>
+                  <span className={`tier-badge tier-${selectedScreenshot.tier}`}>
+                    {selectedScreenshot.tier === "ocr" ? "OCR" : selectedScreenshot.tier === "vision" ? "Vision" : "Edited"}
+                  </span>
+                  <p>{selectedScreenshot.intent}</p>
+                </div>
                 <button
-                  className="btn btn-small"
-                  onClick={() => setPipelineStats(null)}
+                  className="btn btn-small screenshot-modal-close"
+                  onClick={() => setSelectedScreenshot(null)}
+                  aria-label="Close screenshot preview"
                 >
-                  Dismiss
+                  Close
                 </button>
               </div>
-              <div className="stats-grid" role="list" aria-label="Pipeline statistics">
-                <div className="stat-item" role="listitem" aria-label={`Significant Events: ${pipelineStats.significant_events_count}`}>
-                  <span className="stat-number" aria-hidden="true">{pipelineStats.significant_events_count}</span>
-                  <span className="stat-desc" aria-hidden="true">Significant Events</span>
-                </div>
-                <div className="stat-item" role="listitem" aria-label={`Generated Steps: ${pipelineStats.generated_steps_count}`}>
-                  <span className="stat-number" aria-hidden="true">{pipelineStats.generated_steps_count}</span>
-                  <span className="stat-desc" aria-hidden="true">Generated Steps</span>
-                </div>
-                <div className="stat-item" role="listitem" aria-label={`Variables Extracted: ${pipelineStats.variables_count}`}>
-                  <span className="stat-number" aria-hidden="true">{pipelineStats.variables_count}</span>
-                  <span className="stat-desc" aria-hidden="true">Variables Extracted</span>
-                </div>
-                <div className="stat-item" role="listitem" aria-label={`Unit Tasks: ${pipelineStats.unit_tasks_count}`}>
-                  <span className="stat-number" aria-hidden="true">{pipelineStats.unit_tasks_count}</span>
-                  <span className="stat-desc" aria-hidden="true">Unit Tasks</span>
-                </div>
-                <div className="stat-item" role="listitem" aria-label={`GOMS Boundaries: ${pipelineStats.goms_boundaries_count}`}>
-                  <span className="stat-number" aria-hidden="true">{pipelineStats.goms_boundaries_count}</span>
-                  <span className="stat-desc" aria-hidden="true">GOMS Boundaries</span>
-                </div>
-                <div className="stat-item" role="listitem" aria-label={`Context Transitions: ${pipelineStats.context_transitions_count}`}>
-                  <span className="stat-number" aria-hidden="true">{pipelineStats.context_transitions_count}</span>
-                  <span className="stat-desc" aria-hidden="true">Context Transitions</span>
-                </div>
-                <div className="stat-item" role="listitem" aria-label={`Local Recoveries: ${pipelineStats.local_recovery_count}`}>
-                  <span className="stat-number" aria-hidden="true">{pipelineStats.local_recovery_count}</span>
-                  <span className="stat-desc" aria-hidden="true">Local Recoveries</span>
-                </div>
-                <div className="stat-item" role="listitem" aria-label={`LLM Enriched: ${pipelineStats.llm_enriched_count}`}>
-                  <span className="stat-number" aria-hidden="true">{pipelineStats.llm_enriched_count}</span>
-                  <span className="stat-desc" aria-hidden="true">LLM Enriched</span>
-                </div>
-                <div className="stat-item" role="listitem" aria-label={`Trajectory Adjustments: ${pipelineStats.trajectory_adjustments_count}`}>
-                  <span className="stat-number" aria-hidden="true">{pipelineStats.trajectory_adjustments_count}</span>
-                  <span className="stat-desc" aria-hidden="true">Trajectory Adjustments</span>
-                </div>
-                <div className="stat-item" role="listitem" aria-label={`Noise Filtered: ${pipelineStats.noise_filtered_count}`}>
-                  <span className="stat-number" aria-hidden="true">{pipelineStats.noise_filtered_count}</span>
-                  <span className="stat-desc" aria-hidden="true">Noise Filtered</span>
-                </div>
-              </div>
-              {pipelineStats.warnings.length > 0 && (
-                <div className="pipeline-warnings" role="alert">
-                  <h3 className="warnings-title">Warnings ({pipelineStats.warnings.length})</h3>
-                  <ul className="warnings-list">
-                    {pipelineStats.warnings.map((w, i) => (
-                      <li key={i}>{w}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </section>
+            </div>
           )}
 
           {/* Recordings List */}
           <section className="panel">
             <h2 className="panel-title">
               Recordings
-              <button className="btn btn-tiny" onClick={() => loadRecordings()} title="Refresh" disabled={loadingRecordings}>
-                {loadingRecordings ? "Loading..." : "Refresh"}
+              <button className="btn btn-small" onClick={() => loadRecordings()} disabled={loadingRecordings}>
+                {loadingRecordings ? "..." : "Refresh"}
               </button>
             </h2>
             {loadingRecordings && recordings.length === 0 ? (
@@ -974,10 +1182,29 @@ function App() {
                       <div className="recording-meta">
                         <span className="meta-tag">{rec.event_count.toLocaleString()} events</span>
                         <span className="meta-tag">{formatDurationMs(rec.duration_ms)}</span>
+                        {rec.has_screenshots && <span className="meta-tag meta-tag-screenshot">Screenshots</span>}
+                        {rec.has_analysis && <span className="meta-tag meta-tag-analysis">Analyzed</span>}
                       </div>
                       {rec.goal && <p className="recording-goal">{rec.goal}</p>}
                     </div>
                     <div className="recording-actions">
+                      {rec.has_screenshots && !rec.has_analysis && (
+                        <button
+                          className="btn btn-analyze"
+                          onClick={() => handleAnalyzeRecording(rec.name)}
+                          disabled={analyzing === rec.name}
+                        >
+                          {analyzing === rec.name ? "Analyzing..." : "Analyze"}
+                        </button>
+                      )}
+                      {rec.has_analysis && (
+                        <button
+                          className="btn btn-review"
+                          onClick={() => handleOpenReview(rec.name)}
+                        >
+                          Review
+                        </button>
+                      )}
                       <button
                         className="btn btn-generate"
                         onClick={() => handleGenerateSkill(rec.path)}
@@ -986,41 +1213,37 @@ function App() {
                         {generating === rec.path ? "Generating..." : "Generate"}
                       </button>
                       {generatedSkills[rec.path] && (
-                        <>
-                          <button
-                            className="btn btn-small"
-                            onClick={async () => {
-                              const content = await readSkillFile(generatedSkills[rec.path]);
-                              if (content) { setPreviewContent(content); setPreviewName(rec.name); }
-                            }}
-                            title="Preview SKILL.md"
-                          >
-                            Preview
-                          </button>
-                          <button
-                            className="btn btn-small"
-                            onClick={async () => {
-                              const content = await readSkillFile(generatedSkills[rec.path]);
-                              if (content) await copyToClipboard(content, "SKILL.md copied to clipboard");
-                            }}
-                            title="Copy SKILL.md"
-                          >
-                            Copy
-                          </button>
-                        </>
+                        <button
+                          className="btn btn-small"
+                          onClick={async () => {
+                            const content = await readSkillFile(generatedSkills[rec.path]);
+                            if (content) { setPreviewContent(content); setPreviewName(rec.name); }
+                          }}
+                        >
+                          Preview
+                        </button>
+                      )}
+                      {generatedSkills[rec.path] && (
+                        <button
+                          className="btn btn-small"
+                          onClick={async () => {
+                            const content = await readSkillFile(generatedSkills[rec.path]);
+                            if (content) await copyToClipboard(content, "SKILL.md copied to clipboard");
+                          }}
+                        >
+                          Copy
+                        </button>
                       )}
                       <button
                         className="btn btn-small"
                         onClick={() => handleExportRecording(rec.path, rec.name)}
-                        title="Export recording as JSON"
                         disabled={exportingRecording === rec.path}
                       >
-                        {exportingRecording === rec.path ? "Exporting..." : "Export"}
+                        {exportingRecording === rec.path ? "..." : "Export"}
                       </button>
                       <button
                         className="btn btn-small"
                         onClick={() => handleOpenInFinder(rec.path)}
-                        title="Reveal in Finder"
                       >
                         Finder
                       </button>
@@ -1072,8 +1295,8 @@ function App() {
           <section className="panel">
             <h2 className="panel-title">
               Generated Skills
-              <button className="btn btn-tiny" onClick={() => loadSkills()} title="Refresh" disabled={loadingSkills}>
-                {loadingSkills ? "Loading..." : "Refresh"}
+              <button className="btn btn-small" onClick={() => loadSkills()} disabled={loadingSkills}>
+                {loadingSkills ? "..." : "Refresh"}
               </button>
             </h2>
             {loadingSkills && skills.length === 0 ? (
@@ -1121,7 +1344,6 @@ function App() {
                       <button
                         className="btn btn-small"
                         onClick={() => handleOpenInFinder(skill.path)}
-                        title="Reveal in Finder"
                       >
                         Finder
                       </button>
@@ -1205,12 +1427,26 @@ function App() {
                   />
                 </label>
                 <label>
-                  <span className="config-label">LLM Model</span>
-                  <input
-                    type="text"
+                  <span className="config-label">Inference Model</span>
+                  <select
                     value={config.model}
                     onChange={(e) => setConfig({ ...config, model: e.target.value })}
-                  />
+                  >
+                    {MODEL_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span className="config-label">Vision Model</span>
+                  <select
+                    value={config.vision_model}
+                    onChange={(e) => setConfig({ ...config, vision_model: e.target.value })}
+                  >
+                    {MODEL_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
                 </label>
                 <label>
                   <span className="config-label">Temperature (0-2)</span>
@@ -1280,6 +1516,17 @@ function App() {
                   <span className="config-hint">Track window/app focus changes during generation</span>
                 </label>
 
+                <h3 className="config-section-title">Recording Features</h3>
+                <label className="toggle-label">
+                  <input
+                    type="checkbox"
+                    checked={config.capture_screenshots}
+                    onChange={(e) => setConfig({ ...config, capture_screenshots: e.target.checked })}
+                  />
+                  <span>Screenshot Capture</span>
+                  <span className="config-hint">Capture screenshots on significant actions for AI analysis</span>
+                </label>
+
                 <button className="btn btn-primary" onClick={handleSaveConfig} disabled={savingConfig}>
                   {savingConfig ? "Saving..." : "Save Configuration"}
                 </button>
@@ -1325,7 +1572,7 @@ function App() {
             </p>
             <div className="about-meta">
               <span>v0.1.0</span>
-              <span>688 tests passing</span>
+              <span>748 tests passing</span>
             </div>
           </section>
         </div>

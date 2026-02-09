@@ -400,6 +400,9 @@ pub struct EnrichedEvent {
     pub id: uuid::Uuid,
     /// Sequence number in recording
     pub sequence: u64,
+    /// Associated screenshot filename (if captured)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_filename: Option<String>,
 }
 
 impl Default for EnrichedEvent {
@@ -409,6 +412,7 @@ impl Default for EnrichedEvent {
             semantic: None,
             id: uuid::Uuid::nil(),
             sequence: 0,
+            screenshot_filename: None,
         }
     }
 }
@@ -421,6 +425,7 @@ impl EnrichedEvent {
             semantic: None,
             id: uuid::Uuid::new_v4(),
             sequence,
+            screenshot_filename: None,
         }
     }
 

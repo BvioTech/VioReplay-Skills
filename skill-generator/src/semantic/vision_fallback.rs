@@ -276,7 +276,7 @@ impl VisionFallback {
     ///
     /// Uses VNRecognizeTextRequest with accurate recognition level to extract
     /// text regions with bounding boxes and confidence scores.
-    fn perform_ocr_on_image(&self, image_ref: &*mut c_void) -> Vec<TextRegion> {
+    pub fn perform_ocr_on_image(&self, image_ref: &*mut c_void) -> Vec<TextRegion> {
         let image = *image_ref;
         if image.is_null() {
             return Vec::new();

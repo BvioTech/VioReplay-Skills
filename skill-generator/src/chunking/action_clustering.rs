@@ -302,14 +302,40 @@ impl ActionClusterer {
         }
     }
 
-    /// Infer task name from events
+    /// Infer task name from events using semantic context
     fn infer_task_name(&self, events: &[EnrichedEvent]) -> String {
-        // Look for the most significant event
+        // Try to find a named click target
         for event in events {
             if event.raw.event_type.is_click() {
                 if let Some(sem) = &event.semantic {
                     if let Some(title) = &sem.title {
-                        return format!("Click {}", title);
+                        if !title.is_empty() {
+                            return format!("Click {}", title);
+                        }
+                    }
+                    // Fallback: use role + identifier
+                    if let Some(role) = &sem.ax_role {
+                        if let Some(id) = &sem.identifier {
+                            return format!("Click {} ({})", role, id);
+                        }
+                        // Use role + parent context
+                        if let Some(parent) = &sem.parent_title {
+                            if !parent.is_empty() {
+                                return format!("Click {} in {}", role, parent);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect typed text for keyboard-heavy tasks
+        let mut typed_text = String::new();
+        for event in events {
+            if event.raw.event_type.is_keyboard() {
+                if let Some(ch) = event.raw.character {
+                    if !ch.is_control() {
+                        typed_text.push(ch);
                     }
                 }
             }
@@ -319,10 +345,41 @@ impl ActionClusterer {
         let clicks = events.iter().filter(|e| e.raw.event_type.is_click()).count();
         let keys = events.iter().filter(|e| e.raw.event_type.is_keyboard()).count();
 
+        // Try to get window context for more descriptive names
+        let window_context = events.iter()
+            .find_map(|e| e.semantic.as_ref()?.window_title.as_ref())
+            .map(|t| t.as_str())
+            .unwrap_or("");
+
+        let app_name = events.iter()
+            .find_map(|e| e.semantic.as_ref()?.app_name.as_ref())
+            .map(|t| t.as_str())
+            .unwrap_or("");
+
         if keys > clicks {
+            if !typed_text.is_empty() {
+                let preview = if typed_text.len() > 30 {
+                    format!("{}...", &typed_text[..27])
+                } else {
+                    typed_text
+                };
+                if !app_name.is_empty() {
+                    return format!("Type \"{}\" in {}", preview, app_name);
+                }
+                return format!("Type \"{}\"", preview);
+            }
+            if !app_name.is_empty() {
+                return format!("Type in {}", app_name);
+            }
             "Type text".to_string()
         } else if clicks > 0 {
-            "Click".to_string()
+            if !window_context.is_empty() {
+                format!("Click in {}", window_context)
+            } else if !app_name.is_empty() {
+                format!("Click in {}", app_name)
+            } else {
+                "Click".to_string()
+            }
         } else {
             "Action".to_string()
         }
@@ -687,7 +744,7 @@ mod tests {
         ];
 
         let name = clusterer.infer_task_name(&events);
-        assert_eq!(name, "Type text");
+        assert_eq!(name, "Type \"hi\"");
     }
 
     #[test]

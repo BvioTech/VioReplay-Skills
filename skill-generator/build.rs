@@ -5,4 +5,6 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=CoreGraphics");
     // Vision framework for OCR fallback (macOS 10.15+)
     println!("cargo:rustc-link-lib=framework=Vision");
+    // ImageIO framework for JPEG encoding/decoding (screenshot capture)
+    println!("cargo:rustc-link-lib=framework=ImageIO");
 }

@@ -27,7 +27,12 @@ pub struct CaptureConfig {
     pub sampling_rate_hz: u32,
     /// Enable vision fallback
     pub vision_fallback: bool,
+    /// Capture screenshots during recording for analysis
+    #[serde(default = "default_capture_screenshots")]
+    pub capture_screenshots: bool,
 }
+
+fn default_capture_screenshots() -> bool { true }
 
 /// Analysis configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,13 +48,18 @@ pub struct AnalysisConfig {
 /// Code generation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodegenConfig {
-    /// Model for semantic synthesis
+    /// Model for semantic synthesis and skill inference
     pub model: String,
+    /// Model for screenshot Vision analysis (defaults to haiku for speed)
+    #[serde(default = "default_vision_model")]
+    pub vision_model: String,
     /// Temperature for generation
     pub temperature: f32,
     /// Include screenshots in skill
     pub include_screenshots: bool,
 }
+
+fn default_vision_model() -> String { "claude-haiku-4-5-20250929".to_string() }
 
 /// Pipeline feature toggles
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +98,7 @@ impl Default for CaptureConfig {
             ring_buffer_size: 8192,
             sampling_rate_hz: 0,
             vision_fallback: true,
+            capture_screenshots: true,
         }
     }
 }
@@ -105,7 +116,8 @@ impl Default for AnalysisConfig {
 impl Default for CodegenConfig {
     fn default() -> Self {
         Self {
-            model: "claude-sonnet-4-5-20250929".to_string(),
+            model: "claude-opus-4-6".to_string(),
+            vision_model: default_vision_model(),
             temperature: 0.3,
             include_screenshots: false,
         }
@@ -227,6 +239,7 @@ mod tests {
         assert_eq!(capture.ring_buffer_size, 8192);
         assert_eq!(capture.sampling_rate_hz, 0);
         assert!(capture.vision_fallback);
+        assert!(capture.capture_screenshots);
     }
 
     #[test]
@@ -240,7 +253,8 @@ mod tests {
     #[test]
     fn test_codegen_config_defaults() {
         let codegen = CodegenConfig::default();
-        assert_eq!(codegen.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(codegen.model, "claude-opus-4-6");
+        assert_eq!(codegen.vision_model, "claude-haiku-4-5-20250929");
         assert_eq!(codegen.temperature, 0.3);
         assert!(!codegen.include_screenshots);
     }
@@ -312,6 +326,7 @@ mod tests {
                 ring_buffer_size: 4096,
                 sampling_rate_hz: 10,
                 vision_fallback: false,
+                capture_screenshots: false,
             },
             analysis: AnalysisConfig {
                 rdp_epsilon_px: 2.5,
@@ -320,6 +335,7 @@ mod tests {
             },
             codegen: CodegenConfig {
                 model: "claude-sonnet-4-5".to_string(),
+                vision_model: "claude-haiku-4-5-20250929".to_string(),
                 temperature: 0.7,
                 include_screenshots: true,
             },
@@ -329,6 +345,7 @@ mod tests {
         let toml_str = config.to_toml().unwrap();
         assert!(toml_str.contains("ring_buffer_size = 4096"));
         assert!(toml_str.contains("sampling_rate_hz = 10"));
+        assert!(toml_str.contains("capture_screenshots = false"));
         assert!(toml_str.contains("rdp_epsilon_px = 2.5"));
         // Check that temperature field exists and has a reasonable value
         assert!(toml_str.contains("temperature"));
@@ -462,7 +479,7 @@ hesitation_threshold = 0.7
 min_pause_ms = 300
 
 [codegen]
-model = "claude-sonnet-4-5-20250929"
+model = "claude-opus-4-6"
 temperature = 0.3
 include_screenshots = false
 "#).expect("Failed to write config");
@@ -499,6 +516,7 @@ include_screenshots = false
                 ring_buffer_size: 4096,
                 sampling_rate_hz: 5,
                 vision_fallback: false,
+                capture_screenshots: true,
             },
             analysis: AnalysisConfig {
                 rdp_epsilon_px: 5.0,
@@ -506,7 +524,8 @@ include_screenshots = false
                 min_pause_ms: 200,
             },
             codegen: CodegenConfig {
-                model: "claude-sonnet-4-5-20250929".to_string(),
+                model: "claude-opus-4-6".to_string(),
+                vision_model: "claude-haiku-4-5-20250929".to_string(),
                 temperature: 1.0,
                 include_screenshots: true,
             },
@@ -532,7 +551,7 @@ include_screenshots = false
         assert_eq!(deserialized.analysis.rdp_epsilon_px, 5.0);
         assert_eq!(deserialized.analysis.hesitation_threshold, 0.5);
         assert_eq!(deserialized.analysis.min_pause_ms, 200);
-        assert_eq!(deserialized.codegen.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(deserialized.codegen.model, "claude-opus-4-6");
         assert_eq!(deserialized.codegen.temperature, 1.0);
         assert!(deserialized.codegen.include_screenshots);
         assert!(!deserialized.pipeline.use_action_clustering);
@@ -545,8 +564,10 @@ include_screenshots = false
 
     #[test]
     fn test_old_config_without_pipeline_section_deserializes() {
-        // Simulate a legacy config file that does not include a [pipeline] section.
-        // Because PipelineConfig has #[serde(default)], it should use default values.
+        // Simulate a legacy config file that does not include a [pipeline] section
+        // and does not include capture_screenshots.
+        // Because PipelineConfig has #[serde(default)] and capture_screenshots has
+        // #[serde(default = "default_capture_screenshots")], they should use defaults.
         let old_config_toml = r#"
 [capture]
 ring_buffer_size = 8192
@@ -559,7 +580,7 @@ hesitation_threshold = 0.7
 min_pause_ms = 300
 
 [codegen]
-model = "claude-sonnet-4-5-20250929"
+model = "claude-opus-4-6"
 temperature = 0.3
 include_screenshots = false
 "#;
@@ -570,7 +591,10 @@ include_screenshots = false
         // Capture/analysis/codegen should match the TOML values
         assert_eq!(config.capture.ring_buffer_size, 8192);
         assert_eq!(config.analysis.rdp_epsilon_px, 3.0);
-        assert_eq!(config.codegen.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(config.codegen.model, "claude-opus-4-6");
+
+        // capture_screenshots should default to true when absent
+        assert!(config.capture.capture_screenshots);
 
         // Pipeline should use defaults (all true)
         assert!(config.pipeline.use_action_clustering);

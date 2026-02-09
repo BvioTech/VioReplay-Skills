@@ -13,14 +13,24 @@
     "windows": [
       {
         "title": "Skill Generator",
-        "width": 640,
-        "height": 720,
+        "width": 780,
+        "height": 800,
+        "minWidth": 600,
+        "minHeight": 500,
         "resizable": true,
         "center": true
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$HOME/.skill_generator/**",
+          "$HOME/.claude/**",
+          "**"
+        ]
+      }
     }
   },
   "bundle": {

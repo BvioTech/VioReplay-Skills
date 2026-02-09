@@ -59,6 +59,9 @@ ctrlc = "3"
 # HTTP client for Claude API (rustls avoids duplicate core-foundation versions from native-tls)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# Base64 encoding for Claude Vision API
+base64 = "0.22"
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
