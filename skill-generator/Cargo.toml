@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Aezi <aezi.zhu@icloud.com>"]
 description = "Production-grade macOS Skill Generation Engine - transforms user interaction telemetry into Claude Code SKILL.md artifacts"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 # Lock-free ring buffer

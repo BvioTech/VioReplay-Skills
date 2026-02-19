@@ -3,7 +3,7 @@ name = "skill-generator-ui"
 version = "0.1.0"
 description = "Skill Generator - Record and generate Claude Code SKILL.md files"
 authors = ["Aezi"]
-license = "MIT"
+license = "GPL-3.0-or-later"
 edition = "2021"
 
 [lib]
