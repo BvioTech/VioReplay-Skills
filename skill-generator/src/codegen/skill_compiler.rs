@@ -107,6 +107,8 @@ pub struct CompilerConfig {
     pub temperature: f32,
     /// Whether to include screenshots
     pub include_screenshots: bool,
+    /// Whether to filter out error correction tasks from the final SKILL.md
+    pub filter_error_corrections: bool,
 }
 
 impl Default for CompilerConfig {
@@ -115,6 +117,7 @@ impl Default for CompilerConfig {
             semantic_model: "claude-sonnet-4-5-20250929".to_string(),
             temperature: 0.3,
             include_screenshots: false,
+            filter_error_corrections: true,
         }
     }
 }
@@ -145,6 +148,28 @@ impl SkillCompiler {
         tasks: &[UnitTask],
         variables: &[ExtractedVariable],
     ) -> CompiledSkill {
+        // Pre-filter: remove error correction tasks (undo, cancel, backspace-only)
+        // Only filter when the user has the toggle enabled; if disabled, error
+        // corrections are emitted into the SKILL.md as normal steps.
+        let owned_tasks: Vec<UnitTask>;
+        let tasks = if self.config.filter_error_corrections {
+            let filtered: Vec<&UnitTask> = tasks
+                .iter()
+                .filter(|t| !t.is_error_correction)
+                .collect();
+            let error_correction_count = tasks.len() - filtered.len();
+            if error_correction_count > 0 {
+                tracing::debug!(
+                    count = error_correction_count,
+                    "Filtered error correction tasks from skill compilation"
+                );
+            }
+            owned_tasks = filtered.into_iter().cloned().collect();
+            owned_tasks.as_slice()
+        } else {
+            tasks
+        };
+
         // Pass 1: Generate semantic narratives
         let narratives = self.pass_semantic(tasks);
 
@@ -862,6 +887,7 @@ mod tests {
             semantic_model: "custom-model".to_string(),
             temperature: 0.5,
             include_screenshots: true,
+            filter_error_corrections: true,
         };
 
         let compiler = SkillCompiler::with_config(custom_config);
@@ -933,6 +959,9 @@ mod tests {
             end_time: 1100,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         let skill = compiler.compile("click_skill", &[task], &[]);
@@ -981,6 +1010,9 @@ mod tests {
             end_time: 1500,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         let narrative = compiler.generate_narrative(&task);
@@ -1008,6 +1040,9 @@ mod tests {
             end_time: 1100,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         let narrative = compiler.generate_narrative(&task);
@@ -1038,6 +1073,9 @@ mod tests {
             end_time: 1100,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         let task2_undo = UnitTask {
@@ -1053,6 +1091,9 @@ mod tests {
             end_time: 1300,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         let tasks = vec![task1, task2_undo];
@@ -1108,6 +1149,9 @@ mod tests {
                 end_time: 1000 * (i + 1) + 100,
                 nesting_level: 0,
                 parent_id: None,
+                pre_action_screenshot: None,
+                post_action_screenshot: None,
+                is_error_correction: false,
             });
         }
 
@@ -1138,6 +1182,9 @@ mod tests {
             end_time: 1100,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         let task2_escape = UnitTask {
@@ -1153,6 +1200,9 @@ mod tests {
             end_time: 1300,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         let tasks = vec![task1, task2_escape];
@@ -1257,6 +1307,9 @@ mod tests {
                 end_time: 0,
                 nesting_level: 0,
                 parent_id: None,
+                pre_action_screenshot: None,
+                post_action_screenshot: None,
+                is_error_correction: false,
             },
             UnitTask {
                 id: uuid::Uuid::new_v4(),
@@ -1271,6 +1324,9 @@ mod tests {
                 end_time: 0,
                 nesting_level: 0,
                 parent_id: None,
+                pre_action_screenshot: None,
+                post_action_screenshot: None,
+                is_error_correction: false,
             },
         ];
 
@@ -1300,6 +1356,9 @@ mod tests {
             end_time: 0,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         assert!(compiler.is_undo_action(&undo_task));
@@ -1319,6 +1378,9 @@ mod tests {
             end_time: 0,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         assert!(!compiler.is_undo_action(&click_task));
@@ -1366,6 +1428,9 @@ mod tests {
             end_time: 1100,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         let raw2 = RawEvent::mouse(
@@ -1399,6 +1464,9 @@ mod tests {
             end_time: 2100,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         assert!(compiler.tasks_are_similar(&task1, &task2));
@@ -1417,6 +1485,9 @@ mod tests {
             end_time: 3100,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         assert!(!compiler.tasks_are_similar(&task1, &task3));

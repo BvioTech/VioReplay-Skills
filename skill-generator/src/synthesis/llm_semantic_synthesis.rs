@@ -19,6 +19,19 @@ pub struct SynthesisResult {
     pub confidence: f32,
 }
 
+/// Context for before/after state diffing — carries image pairs for LLM analysis.
+#[derive(Debug, Clone)]
+pub struct StateDiffContext {
+    /// Base64-encoded JPEG of the screenshot before the action (State A).
+    /// Wrapped in Arc to allow cheap sharing across sequential task boundaries
+    /// (Task N's post = Task N+1's pre).
+    pub pre_action_b64: Option<std::sync::Arc<String>>,
+    /// Base64-encoded JPEG of the screenshot after the action (State B).
+    pub post_action_b64: Option<std::sync::Arc<String>>,
+    /// The recording's goal for context
+    pub goal: String,
+}
+
 /// Cache entry for LLM responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEntry {
@@ -209,6 +222,7 @@ impl LlmSynthesizer {
 
         format!(
             r#"You are analyzing a user interaction recording to identify variables for skill generation.
+Note: Some actions may be tagged as error corrections (undo, cancel, backspace-only). These are part of the state timeline — the user corrected a mistake. Account for their effect on UI state but focus on the intentional actions for variable extraction.
 
 Goal: {}
 
@@ -338,6 +352,83 @@ Respond in JSON format:
             .as_secs();
 
         self.cache.retain(|_, entry| now.saturating_sub(entry.timestamp) < self.cache_ttl);
+    }
+
+    /// Synthesize intent from a before/after screenshot pair.
+    ///
+    /// Sends both images to Claude Vision API and asks it to describe
+    /// what changed and what the user was trying to accomplish.
+    pub async fn synthesize_with_state_diff(
+        &self,
+        context: &StateDiffContext,
+        action_description: &str,
+    ) -> Option<String> {
+        let api_key = self.api_key.as_ref()?;
+        let pre_b64 = context.pre_action_b64.as_ref()?;
+        let post_b64 = context.post_action_b64.as_ref()?;
+
+        let prompt = format!(
+            "Image A is the UI state before the user acted. Image B is the state after. \
+             The action performed was: {}. The user's overall goal is: '{}'. \
+             This action may be an error correction (undo/cancel) — if so, account for its \
+             effect on the visual state. \
+             If a colored line is visible on either image, it shows the mouse trajectory \
+             prior to the click. \
+             By comparing the two images, what changed visually (e.g., a modal appeared, \
+             text was inputted, a menu opened)? What was the user trying to accomplish? \
+             Describe in one sentence.",
+            action_description,
+            context.goal,
+        );
+
+        let body = serde_json::json!({
+            "model": self.model,
+            "max_tokens": 256,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": pre_b64.as_str()
+                        }
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": post_b64.as_str()
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt
+                    }
+                ]
+            }]
+        });
+
+        let response = crate::semantic::http_retry::send_with_retry(
+            &self.client,
+            |c| c.post(&self.api_endpoint)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body),
+            1,
+            "state diff synthesis",
+        ).await?;
+
+        #[derive(serde::Deserialize)]
+        struct Resp { content: Vec<Block> }
+        #[derive(serde::Deserialize)]
+        struct Block { text: String }
+
+        let resp: Resp = response.json().await.ok()?;
+        resp.content.first().map(|b| b.text.trim().to_string())
     }
 }
 
@@ -726,5 +817,55 @@ mod tests {
             assert!(cached.is_some());
             assert_eq!(cached.unwrap().variable_type, format!("type{}", i));
         }
+    }
+
+    #[test]
+    fn test_state_diff_context_creation() {
+        let ctx = StateDiffContext {
+            pre_action_b64: Some(std::sync::Arc::new("/9j".to_string())),
+            post_action_b64: Some(std::sync::Arc::new("/9j".to_string())),
+            goal: "Test goal".to_string(),
+        };
+        assert!(ctx.pre_action_b64.is_some());
+        assert!(ctx.post_action_b64.is_some());
+        assert_eq!(ctx.goal, "Test goal");
+    }
+
+    #[test]
+    fn test_state_diff_context_empty() {
+        let ctx = StateDiffContext {
+            pre_action_b64: None,
+            post_action_b64: None,
+            goal: String::new(),
+        };
+        assert!(ctx.pre_action_b64.is_none());
+        assert!(ctx.post_action_b64.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_synthesize_with_state_diff_no_api_key() {
+        let synth = LlmSynthesizer::new();
+        let ctx = StateDiffContext {
+            pre_action_b64: Some(std::sync::Arc::new("/9j".to_string())),
+            post_action_b64: Some(std::sync::Arc::new("/9j".to_string())),
+            goal: "Test".to_string(),
+        };
+        // Without API key, should return None
+        let result = synth.synthesize_with_state_diff(&ctx, "click button").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_synthesize_with_state_diff_missing_images() {
+        let mut synth = LlmSynthesizer::new();
+        synth.api_key = Some("test-key".to_string());
+        let ctx = StateDiffContext {
+            pre_action_b64: None,
+            post_action_b64: Some(std::sync::Arc::new("/9j".to_string())),
+            goal: "Test".to_string(),
+        };
+        // Missing pre-action image should return None
+        let result = synth.synthesize_with_state_diff(&ctx, "click button").await;
+        assert!(result.is_none());
     }
 }

@@ -62,6 +62,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Base64 encoding for Claude Vision API
 base64 = "0.22"
 
+# Image processing for visual anchoring (annotation, cropping)
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+imageproc = "0.25"
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"

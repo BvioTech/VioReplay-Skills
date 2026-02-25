@@ -16,6 +16,9 @@ pub struct Config {
     /// Pipeline feature toggles
     #[serde(default)]
     pub pipeline: PipelineConfig,
+    /// Annotation overlay settings
+    #[serde(default)]
+    pub annotation: AnnotationSettings,
 }
 
 /// Capture configuration
@@ -31,6 +34,8 @@ pub struct CaptureConfig {
     #[serde(default = "default_capture_screenshots")]
     pub capture_screenshots: bool,
 }
+
+fn default_true() -> bool { true }
 
 fn default_capture_screenshots() -> bool { true }
 
@@ -61,6 +66,49 @@ pub struct CodegenConfig {
 
 fn default_vision_model() -> String { "claude-haiku-4-5-20250929".to_string() }
 
+fn default_dot_radius() -> u32 { 12 }
+fn default_dot_color() -> [u8; 3] { [255, 40, 40] }
+fn default_trajectory_ballistic_color() -> [u8; 3] { [40, 220, 40] }
+fn default_trajectory_searching_color() -> [u8; 3] { [255, 160, 40] }
+fn default_trajectory_thickness() -> u32 { 2 }
+fn default_crop_size() -> u32 { 512 }
+
+/// Annotation overlay settings for screenshot annotations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnotationSettings {
+    /// Radius of the click-dot overlay in pixels
+    #[serde(default = "default_dot_radius")]
+    pub dot_radius: u32,
+    /// RGB color for click dots
+    #[serde(default = "default_dot_color")]
+    pub dot_color: [u8; 3],
+    /// RGB color for ballistic trajectory segments
+    #[serde(default = "default_trajectory_ballistic_color")]
+    pub trajectory_ballistic_color: [u8; 3],
+    /// RGB color for searching/corrective trajectory segments
+    #[serde(default = "default_trajectory_searching_color")]
+    pub trajectory_searching_color: [u8; 3],
+    /// Line thickness for trajectory overlays in pixels
+    #[serde(default = "default_trajectory_thickness")]
+    pub trajectory_thickness: u32,
+    /// Crop size for annotated screenshot regions in pixels
+    #[serde(default = "default_crop_size")]
+    pub crop_size: u32,
+}
+
+impl Default for AnnotationSettings {
+    fn default() -> Self {
+        Self {
+            dot_radius: default_dot_radius(),
+            dot_color: default_dot_color(),
+            trajectory_ballistic_color: default_trajectory_ballistic_color(),
+            trajectory_searching_color: default_trajectory_searching_color(),
+            trajectory_thickness: default_trajectory_thickness(),
+            crop_size: default_crop_size(),
+        }
+    }
+}
+
 /// Pipeline feature toggles
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
@@ -76,6 +124,12 @@ pub struct PipelineConfig {
     pub use_goms_detection: bool,
     /// Use ContextStack to track window/app context changes
     pub use_context_tracking: bool,
+    /// Use StateDiff to detect UI state changes between actions
+    #[serde(default = "default_true")]
+    pub use_state_diff: bool,
+    /// Use error correction filter to remove corrective action sequences
+    #[serde(default = "default_true")]
+    pub use_error_correction_filter: bool,
 }
 
 impl Default for PipelineConfig {
@@ -87,6 +141,8 @@ impl Default for PipelineConfig {
             use_trajectory_analysis: true,
             use_goms_detection: true,
             use_context_tracking: true,
+            use_state_diff: true,
+            use_error_correction_filter: true,
         }
     }
 }
@@ -268,6 +324,8 @@ mod tests {
         assert!(pipeline.use_trajectory_analysis);
         assert!(pipeline.use_goms_detection);
         assert!(pipeline.use_context_tracking);
+        assert!(pipeline.use_state_diff);
+        assert!(pipeline.use_error_correction_filter);
     }
 
     #[test]
@@ -340,6 +398,7 @@ mod tests {
                 include_screenshots: true,
             },
             pipeline: PipelineConfig::default(),
+            annotation: AnnotationSettings::default(),
         };
 
         let toml_str = config.to_toml().unwrap();
@@ -496,6 +555,8 @@ include_screenshots = false
             use_trajectory_analysis: true,
             use_goms_detection: false,
             use_context_tracking: true,
+            use_state_diff: false,
+            use_error_correction_filter: true,
         };
 
         let toml_str = toml::to_string_pretty(&pipeline).expect("Failed to serialize PipelineConfig");
@@ -507,6 +568,8 @@ include_screenshots = false
         assert!(deserialized.use_trajectory_analysis);
         assert!(!deserialized.use_goms_detection);
         assert!(deserialized.use_context_tracking);
+        assert!(!deserialized.use_state_diff);
+        assert!(deserialized.use_error_correction_filter);
     }
 
     #[test]
@@ -536,13 +599,17 @@ include_screenshots = false
                 use_trajectory_analysis: true,
                 use_goms_detection: true,
                 use_context_tracking: false,
+                use_state_diff: true,
+                use_error_correction_filter: false,
             },
+            annotation: AnnotationSettings::default(),
         };
 
         let toml_str = config.to_toml().expect("Failed to serialize Config");
         assert!(toml_str.contains("[pipeline]"));
         assert!(toml_str.contains("use_action_clustering = false"));
         assert!(toml_str.contains("use_context_tracking = false"));
+        assert!(toml_str.contains("[annotation]"));
 
         let deserialized: Config = toml::from_str(&toml_str).expect("Failed to deserialize Config");
         assert_eq!(deserialized.capture.ring_buffer_size, 4096);
@@ -560,6 +627,10 @@ include_screenshots = false
         assert!(deserialized.pipeline.use_trajectory_analysis);
         assert!(deserialized.pipeline.use_goms_detection);
         assert!(!deserialized.pipeline.use_context_tracking);
+        assert!(deserialized.pipeline.use_state_diff);
+        assert!(!deserialized.pipeline.use_error_correction_filter);
+        assert_eq!(deserialized.annotation.dot_radius, 12);
+        assert_eq!(deserialized.annotation.crop_size, 512);
     }
 
     #[test]
@@ -603,5 +674,70 @@ include_screenshots = false
         assert!(config.pipeline.use_trajectory_analysis);
         assert!(config.pipeline.use_goms_detection);
         assert!(config.pipeline.use_context_tracking);
+        assert!(config.pipeline.use_state_diff);
+        assert!(config.pipeline.use_error_correction_filter);
+
+        // Annotation should use defaults
+        assert_eq!(config.annotation.dot_radius, 12);
+        assert_eq!(config.annotation.dot_color, [255, 40, 40]);
+        assert_eq!(config.annotation.trajectory_ballistic_color, [40, 220, 40]);
+        assert_eq!(config.annotation.trajectory_searching_color, [255, 160, 40]);
+        assert_eq!(config.annotation.trajectory_thickness, 2);
+        assert_eq!(config.annotation.crop_size, 512);
+    }
+
+    #[test]
+    fn test_annotation_settings_defaults() {
+        let annotation = AnnotationSettings::default();
+        assert_eq!(annotation.dot_radius, 12);
+        assert_eq!(annotation.dot_color, [255, 40, 40]);
+        assert_eq!(annotation.trajectory_ballistic_color, [40, 220, 40]);
+        assert_eq!(annotation.trajectory_searching_color, [255, 160, 40]);
+        assert_eq!(annotation.trajectory_thickness, 2);
+        assert_eq!(annotation.crop_size, 512);
+    }
+
+    #[test]
+    fn test_old_config_without_annotation_section_deserializes() {
+        // Config with [pipeline] but no [annotation] section
+        let config_toml = r#"
+[capture]
+ring_buffer_size = 8192
+sampling_rate_hz = 0
+vision_fallback = true
+
+[analysis]
+rdp_epsilon_px = 3.0
+hesitation_threshold = 0.7
+min_pause_ms = 300
+
+[codegen]
+model = "claude-opus-4-6"
+temperature = 0.3
+include_screenshots = false
+
+[pipeline]
+use_action_clustering = true
+use_local_recovery = true
+use_vision_ocr = true
+use_trajectory_analysis = true
+use_goms_detection = true
+use_context_tracking = true
+"#;
+
+        let config: Config = toml::from_str(config_toml)
+            .expect("Config without [annotation] should deserialize successfully");
+
+        // Annotation should use all defaults
+        assert_eq!(config.annotation.dot_radius, 12);
+        assert_eq!(config.annotation.dot_color, [255, 40, 40]);
+        assert_eq!(config.annotation.trajectory_ballistic_color, [40, 220, 40]);
+        assert_eq!(config.annotation.trajectory_searching_color, [255, 160, 40]);
+        assert_eq!(config.annotation.trajectory_thickness, 2);
+        assert_eq!(config.annotation.crop_size, 512);
+
+        // New pipeline fields should also default to true when absent
+        assert!(config.pipeline.use_state_diff);
+        assert!(config.pipeline.use_error_correction_filter);
     }
 }

@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use skill_generator::app::config::Config;
-use skill_generator::capture::event_tap::{check_accessibility_permissions, check_screen_recording_permission};
+use skill_generator::capture::event_tap::{check_accessibility_permissions, check_screen_recording_permission, was_hotkey_stopped};
 use skill_generator::capture::ring_buffer::{EventRingBuffer, DEFAULT_CAPACITY};
 use skill_generator::time::timebase::MachTimebase;
 use skill_generator::workflow::generator::SkillGenerator;
@@ -196,6 +196,8 @@ pub struct RecordingStatus {
     pub duration_seconds: f64,
     pub has_accessibility: bool,
     pub has_screen_recording: bool,
+    /// True when recording was stopped by the global hotkey (Cmd+Opt+Ctrl+S)
+    pub hotkey_stopped: bool,
 }
 
 /// Pipeline statistics for the frontend
@@ -212,6 +214,8 @@ pub struct PipelineStatsInfo {
     pub variables_count: usize,
     pub generated_steps_count: usize,
     pub screenshot_enhanced_count: usize,
+    pub state_diff_enriched_count: usize,
+    pub error_correction_count: usize,
     pub warnings: Vec<String>,
 }
 
@@ -425,6 +429,7 @@ fn get_recording_status(state: State<AppState>) -> Result<RecordingStatus, Strin
             duration_seconds: 0.0,
             has_accessibility: check_accessibility_permissions(),
             has_screen_recording: check_screen_recording_permission(),
+            hotkey_stopped: false,
         });
     }
 
@@ -514,6 +519,7 @@ fn get_recording_status(state: State<AppState>) -> Result<RecordingStatus, Strin
         duration_seconds: duration,
         has_accessibility: check_accessibility_permissions(),
         has_screen_recording: check_screen_recording_permission(),
+        hotkey_stopped: was_hotkey_stopped(),
     })
 }
 
@@ -556,6 +562,11 @@ fn stop_recording(state: State<AppState>) -> Result<RecordingInfo, String> {
             let batch = cons.pop_batch(STOP_DRAIN_BATCH_SIZE);
             for slot in batch {
                 rec.add_raw_event(slot.event);
+            }
+            // Trim trailing FlagsChanged events caused by the stop hotkey modifier keys
+            // (Cmd/Opt/Ctrl pressed before 'S'). These are recording pollution.
+            while rec.events.last().is_some_and(|e| e.raw.event_type == EventType::FlagsChanged) {
+                rec.events.pop();
             }
             // Mark recording as having screenshots
             if had_screenshots {
@@ -955,6 +966,8 @@ async fn generate_skill(state: State<'_, AppState>, recording_path: String) -> R
             use_trajectory_analysis: config.pipeline.use_trajectory_analysis,
             use_goms_detection: config.pipeline.use_goms_detection,
             use_context_tracking: config.pipeline.use_context_tracking,
+            use_state_diff: config.pipeline.use_state_diff,
+            use_error_correction_filter: config.pipeline.use_error_correction_filter,
             screenshot_analysis,
             ..Default::default()
         };
@@ -1023,6 +1036,8 @@ async fn generate_skill(state: State<'_, AppState>, recording_path: String) -> R
                 variables_count: skill.stats.variables_count,
                 generated_steps_count: skill.stats.generated_steps_count,
                 screenshot_enhanced_count: skill.stats.screenshot_enhanced_count,
+                state_diff_enriched_count: skill.stats.state_diff_enriched_count,
+                error_correction_count: skill.stats.error_correction_count,
                 warnings: skill.stats.warnings.clone(),
             },
         })
@@ -1070,11 +1085,24 @@ async fn analyze_recording(state: State<'_, AppState>, recording_name: String) -
             ..AnalysisConfig::default()
         };
 
+        let annotation_config = skill_generator::semantic::screenshot::AnnotationConfig {
+            dot_radius: app_config.annotation.dot_radius as i32,
+            dot_color: app_config.annotation.dot_color,
+            box_color: [0, 255, 100],
+            box_thickness: 2,
+            crop_size: app_config.annotation.crop_size,
+            jpeg_quality: 85,
+            trajectory_ballistic_color: app_config.annotation.trajectory_ballistic_color,
+            trajectory_searching_color: app_config.annotation.trajectory_searching_color,
+            trajectory_thickness: app_config.annotation.trajectory_thickness,
+        };
+
         let analysis = sa::analyze_recording(
             &rec_dir,
             &recording,
             api_key_value.as_deref(),
             &config,
+            &annotation_config,
         );
 
         sa::save_analysis(&analysis, &rec_dir).map_err(|e| e.to_string())?;
@@ -1302,12 +1330,35 @@ pub struct UiConfig {
     pub use_trajectory_analysis: bool,
     pub use_goms_detection: bool,
     pub use_context_tracking: bool,
+    #[serde(default = "default_true")]
+    pub use_state_diff: bool,
+    #[serde(default = "default_true")]
+    pub use_error_correction_filter: bool,
     #[serde(default = "default_capture_screenshots")]
     pub capture_screenshots: bool,
+    #[serde(default = "default_dot_radius")]
+    pub dot_radius: u32,
+    #[serde(default = "default_dot_color")]
+    pub dot_color: [u8; 3],
+    #[serde(default = "default_trajectory_ballistic_color")]
+    pub trajectory_ballistic_color: [u8; 3],
+    #[serde(default = "default_trajectory_searching_color")]
+    pub trajectory_searching_color: [u8; 3],
+    #[serde(default = "default_trajectory_thickness")]
+    pub trajectory_thickness: u32,
+    #[serde(default = "default_crop_size")]
+    pub crop_size: u32,
 }
 
 fn default_capture_screenshots() -> bool { true }
 fn default_vision_model() -> String { "claude-haiku-4-5-20250929".to_string() }
+fn default_true() -> bool { true }
+fn default_dot_radius() -> u32 { 12 }
+fn default_dot_color() -> [u8; 3] { [255, 40, 40] }
+fn default_trajectory_ballistic_color() -> [u8; 3] { [40, 220, 40] }
+fn default_trajectory_searching_color() -> [u8; 3] { [255, 160, 40] }
+fn default_trajectory_thickness() -> u32 { 2 }
+fn default_crop_size() -> u32 { 512 }
 
 /// Get current generator configuration
 #[tauri::command]
@@ -1328,7 +1379,15 @@ fn get_config(state: State<AppState>) -> Result<UiConfig, String> {
         use_trajectory_analysis: config.pipeline.use_trajectory_analysis,
         use_goms_detection: config.pipeline.use_goms_detection,
         use_context_tracking: config.pipeline.use_context_tracking,
+        use_state_diff: config.pipeline.use_state_diff,
+        use_error_correction_filter: config.pipeline.use_error_correction_filter,
         capture_screenshots,
+        dot_radius: config.annotation.dot_radius,
+        dot_color: config.annotation.dot_color,
+        trajectory_ballistic_color: config.annotation.trajectory_ballistic_color,
+        trajectory_searching_color: config.annotation.trajectory_searching_color,
+        trajectory_thickness: config.annotation.trajectory_thickness,
+        crop_size: config.annotation.crop_size,
     })
 }
 
@@ -1348,7 +1407,15 @@ fn save_config(state: State<AppState>, config: UiConfig) -> Result<(), String> {
     full_config.pipeline.use_trajectory_analysis = config.use_trajectory_analysis;
     full_config.pipeline.use_goms_detection = config.use_goms_detection;
     full_config.pipeline.use_context_tracking = config.use_context_tracking;
+    full_config.pipeline.use_state_diff = config.use_state_diff;
+    full_config.pipeline.use_error_correction_filter = config.use_error_correction_filter;
     full_config.capture.capture_screenshots = config.capture_screenshots;
+    full_config.annotation.dot_radius = config.dot_radius;
+    full_config.annotation.dot_color = config.dot_color;
+    full_config.annotation.trajectory_ballistic_color = config.trajectory_ballistic_color;
+    full_config.annotation.trajectory_searching_color = config.trajectory_searching_color;
+    full_config.annotation.trajectory_thickness = config.trajectory_thickness;
+    full_config.annotation.crop_size = config.crop_size;
     full_config.validate().map_err(|e| e.to_string())?;
     full_config.save_default().map_err(|e| e.to_string())?;
 
@@ -1679,6 +1746,8 @@ mod tests {
             variables_count: 8,
             generated_steps_count: 9,
             screenshot_enhanced_count: 0,
+            state_diff_enriched_count: 0,
+            error_correction_count: 0,
             warnings: vec!["test warning".to_string()],
         };
         let json = serde_json::to_string(&stats).unwrap();
@@ -1706,6 +1775,8 @@ mod tests {
                 variables_count: 2,
                 generated_steps_count: 5,
                 screenshot_enhanced_count: 0,
+                state_diff_enriched_count: 0,
+                error_correction_count: 0,
                 warnings: vec![],
             },
         };
@@ -1761,7 +1832,15 @@ mod tests {
             use_trajectory_analysis: true,
             use_goms_detection: true,
             use_context_tracking: true,
+            use_state_diff: true,
+            use_error_correction_filter: true,
             capture_screenshots: true,
+            dot_radius: 12,
+            dot_color: [255, 40, 40],
+            trajectory_ballistic_color: [40, 220, 40],
+            trajectory_searching_color: [255, 160, 40],
+            trajectory_thickness: 2,
+            crop_size: 512,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: UiConfig = serde_json::from_str(&json).unwrap();

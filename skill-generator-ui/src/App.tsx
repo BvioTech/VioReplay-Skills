@@ -9,6 +9,7 @@ interface RecordingStatus {
   duration_seconds: number;
   has_accessibility: boolean;
   has_screen_recording: boolean;
+  hotkey_stopped: boolean;
 }
 
 interface RecordingInfo {
@@ -53,6 +54,8 @@ interface PipelineStatsInfo {
   variables_count: number;
   generated_steps_count: number;
   screenshot_enhanced_count: number;
+  state_diff_enriched_count: number;
+  error_correction_count: number;
   warnings: string[];
 }
 
@@ -78,6 +81,14 @@ interface UiConfig {
   use_goms_detection: boolean;
   use_context_tracking: boolean;
   capture_screenshots: boolean;
+  use_state_diff: boolean;
+  use_error_correction_filter: boolean;
+  dot_radius: number;
+  dot_color: number[];
+  trajectory_ballistic_color: number[];
+  trajectory_searching_color: number[];
+  trajectory_thickness: number;
+  crop_size: number;
 }
 
 const MODEL_OPTIONS = [
@@ -312,6 +323,7 @@ function App() {
 
   // Config state
   const [config, setConfig] = useState<UiConfig | null>(null);
+  const [showAnnotationSettings, setShowAnnotationSettings] = useState(false);
 
   // Timer ref
   const timerRef = useRef<number | null>(null);
@@ -385,6 +397,11 @@ function App() {
       setDuration(status.duration_seconds);
       setHasAccessibility(status.has_accessibility);
       setHasScreenRecording(status.has_screen_recording);
+
+      // Auto-stop when global hotkey (Cmd+Opt+Ctrl+S) was pressed
+      if (status.hotkey_stopped && status.is_recording) {
+        handleStopRecording();
+      }
     } catch (e) {
       console.error("Failed to get status:", e);
     }
@@ -960,7 +977,7 @@ function App() {
 
                 <button className="btn btn-stop btn-full" onClick={handleStopRecording}>
                   Stop Recording
-                  <span className="shortcut-hint">ESC</span>
+                  <span className="shortcut-hint">&#8963;&#8997;&#8984;S</span>
                 </button>
               </>
             ) : (
@@ -1044,6 +1061,8 @@ function App() {
                 {pipelineStats.generated_steps_count} steps
                 {pipelineStats.variables_count > 0 && ` / ${pipelineStats.variables_count} vars`}
                 {pipelineStats.screenshot_enhanced_count > 0 && ` / ${pipelineStats.screenshot_enhanced_count} enhanced`}
+                {pipelineStats.state_diff_enriched_count > 0 && ` / ${pipelineStats.state_diff_enriched_count} diffs`}
+                {pipelineStats.error_correction_count > 0 && ` / ${pipelineStats.error_correction_count} filtered`}
                 {pipelineStats.warnings.length > 0 && ` / ${pipelineStats.warnings.length} warnings`}
               </span>
               <button className="btn btn-tiny" onClick={() => setPipelineStats(null)}>Dismiss</button>
@@ -1515,6 +1534,24 @@ function App() {
                   <span>Context Tracking</span>
                   <span className="config-hint">Track window/app focus changes during generation</span>
                 </label>
+                <label className="toggle-label">
+                  <input
+                    type="checkbox"
+                    checked={config.use_state_diff}
+                    onChange={(e) => setConfig({ ...config, use_state_diff: e.target.checked })}
+                  />
+                  <span>State Diff Analysis</span>
+                  <span className="config-hint">Before/after screenshot comparison for UI state changes</span>
+                </label>
+                <label className="toggle-label">
+                  <input
+                    type="checkbox"
+                    checked={config.use_error_correction_filter}
+                    onChange={(e) => setConfig({ ...config, use_error_correction_filter: e.target.checked })}
+                  />
+                  <span>Error Correction Filter</span>
+                  <span className="config-hint">Remove undo, cancel, and backspace-only actions from output</span>
+                </label>
 
                 <h3 className="config-section-title">Recording Features</h3>
                 <label className="toggle-label">
@@ -1526,6 +1563,138 @@ function App() {
                   <span>Screenshot Capture</span>
                   <span className="config-hint">Capture screenshots on significant actions for AI analysis</span>
                 </label>
+
+                <h3
+                  className="config-section-title config-section-collapsible"
+                  onClick={() => setShowAnnotationSettings(!showAnnotationSettings)}
+                >
+                  {showAnnotationSettings ? "▾" : "▸"} Visual Annotation
+                </h3>
+                {showAnnotationSettings && (
+                  <div className="annotation-settings">
+                    <label>
+                      <span className="config-label">Dot Radius ({config.dot_radius}px)</span>
+                      <input
+                        type="range"
+                        min="4"
+                        max="24"
+                        value={config.dot_radius}
+                        onChange={(e) => setConfig({ ...config, dot_radius: parseInt(e.target.value) })}
+                      />
+                    </label>
+                    <label>
+                      <span className="config-label">Dot Color</span>
+                      <div className="color-inputs">
+                        <input
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={config.dot_color[0]}
+                          onChange={(e) => { const v = parseInt(e.target.value); if (!Number.isNaN(v)) setConfig({ ...config, dot_color: [v, config.dot_color[1], config.dot_color[2]] }); }}
+                          aria-label="Red"
+                        />
+                        <input
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={config.dot_color[1]}
+                          onChange={(e) => { const v = parseInt(e.target.value); if (!Number.isNaN(v)) setConfig({ ...config, dot_color: [config.dot_color[0], v, config.dot_color[2]] }); }}
+                          aria-label="Green"
+                        />
+                        <input
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={config.dot_color[2]}
+                          onChange={(e) => { const v = parseInt(e.target.value); if (!Number.isNaN(v)) setConfig({ ...config, dot_color: [config.dot_color[0], config.dot_color[1], v] }); }}
+                          aria-label="Blue"
+                        />
+                        <span className="color-preview" style={{ backgroundColor: `rgb(${config.dot_color[0]}, ${config.dot_color[1]}, ${config.dot_color[2]})` }} />
+                      </div>
+                    </label>
+                    <label>
+                      <span className="config-label">Ballistic Trajectory Color</span>
+                      <div className="color-inputs">
+                        <input
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={config.trajectory_ballistic_color[0]}
+                          onChange={(e) => { const v = parseInt(e.target.value); if (!Number.isNaN(v)) setConfig({ ...config, trajectory_ballistic_color: [v, config.trajectory_ballistic_color[1], config.trajectory_ballistic_color[2]] }); }}
+                          aria-label="Red"
+                        />
+                        <input
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={config.trajectory_ballistic_color[1]}
+                          onChange={(e) => { const v = parseInt(e.target.value); if (!Number.isNaN(v)) setConfig({ ...config, trajectory_ballistic_color: [config.trajectory_ballistic_color[0], v, config.trajectory_ballistic_color[2]] }); }}
+                          aria-label="Green"
+                        />
+                        <input
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={config.trajectory_ballistic_color[2]}
+                          onChange={(e) => { const v = parseInt(e.target.value); if (!Number.isNaN(v)) setConfig({ ...config, trajectory_ballistic_color: [config.trajectory_ballistic_color[0], config.trajectory_ballistic_color[1], v] }); }}
+                          aria-label="Blue"
+                        />
+                        <span className="color-preview" style={{ backgroundColor: `rgb(${config.trajectory_ballistic_color[0]}, ${config.trajectory_ballistic_color[1]}, ${config.trajectory_ballistic_color[2]})` }} />
+                      </div>
+                    </label>
+                    <label>
+                      <span className="config-label">Searching Trajectory Color</span>
+                      <div className="color-inputs">
+                        <input
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={config.trajectory_searching_color[0]}
+                          onChange={(e) => { const v = parseInt(e.target.value); if (!Number.isNaN(v)) setConfig({ ...config, trajectory_searching_color: [v, config.trajectory_searching_color[1], config.trajectory_searching_color[2]] }); }}
+                          aria-label="Red"
+                        />
+                        <input
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={config.trajectory_searching_color[1]}
+                          onChange={(e) => { const v = parseInt(e.target.value); if (!Number.isNaN(v)) setConfig({ ...config, trajectory_searching_color: [config.trajectory_searching_color[0], v, config.trajectory_searching_color[2]] }); }}
+                          aria-label="Green"
+                        />
+                        <input
+                          type="number"
+                          min="0"
+                          max="255"
+                          value={config.trajectory_searching_color[2]}
+                          onChange={(e) => { const v = parseInt(e.target.value); if (!Number.isNaN(v)) setConfig({ ...config, trajectory_searching_color: [config.trajectory_searching_color[0], config.trajectory_searching_color[1], v] }); }}
+                          aria-label="Blue"
+                        />
+                        <span className="color-preview" style={{ backgroundColor: `rgb(${config.trajectory_searching_color[0]}, ${config.trajectory_searching_color[1]}, ${config.trajectory_searching_color[2]})` }} />
+                      </div>
+                    </label>
+                    <label>
+                      <span className="config-label">Trajectory Thickness ({config.trajectory_thickness}px)</span>
+                      <input
+                        type="range"
+                        min="1"
+                        max="5"
+                        value={config.trajectory_thickness}
+                        onChange={(e) => setConfig({ ...config, trajectory_thickness: parseInt(e.target.value) })}
+                      />
+                    </label>
+                    <label>
+                      <span className="config-label">Crop Size ({config.crop_size}px)</span>
+                      <input
+                        type="range"
+                        min="256"
+                        max="1024"
+                        step="64"
+                        value={config.crop_size}
+                        onChange={(e) => setConfig({ ...config, crop_size: parseInt(e.target.value) })}
+                      />
+                    </label>
+                  </div>
+                )}
 
                 <button className="btn btn-primary" onClick={handleSaveConfig} disabled={savingConfig}>
                   {savingConfig ? "Saving..." : "Save Configuration"}

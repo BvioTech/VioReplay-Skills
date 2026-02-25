@@ -4,6 +4,7 @@
 //! selector ranking, and verification blocks.
 
 use super::recording::Recording;
+use base64::Engine;
 use crate::analysis::intent_binding::{Action, ScrollDirection};
 use crate::analysis::kinematic_segmentation::{KinematicSegmenter, MovementPattern};
 use crate::analysis::rdp_simplification::RdpSimplifier;
@@ -68,8 +69,14 @@ pub struct GeneratorConfig {
     pub use_goms_detection: bool,
     /// Use ContextStack to track window/app context changes during generation
     pub use_context_tracking: bool,
+    /// Use state diff analysis (before/after screenshots) to enrich UnitTasks
+    pub use_state_diff: bool,
+    /// Use error correction filter to skip undo/cancel/backspace tasks
+    pub use_error_correction_filter: bool,
     /// Screenshot analysis intents to overlay onto steps (sequence → intent)
     pub screenshot_analysis: Option<Vec<(u64, String)>>,
+    /// Directory containing the recording file (used to locate screenshots for state diff)
+    pub recording_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for GeneratorConfig {
@@ -88,7 +95,10 @@ impl Default for GeneratorConfig {
             use_trajectory_analysis: true,
             use_goms_detection: true,
             use_context_tracking: true,
+            use_state_diff: true,
+            use_error_correction_filter: true,
             screenshot_analysis: None,
+            recording_dir: None,
         }
     }
 }
@@ -270,7 +280,7 @@ impl SkillGenerator {
         let actions = self.bind_intents(&significant_events, &enriched_recording);
 
         // Step 2.5: Cluster significant events into UnitTasks (if enabled)
-        let unit_tasks = if self.config.use_action_clustering {
+        let mut unit_tasks = if self.config.use_action_clustering {
             let action_list: Vec<Action> = actions.iter().map(|(_, a)| a.clone()).collect();
             let sig_events: Vec<EnrichedEvent> = significant_events.iter().map(|e| (*e).clone()).collect();
             let tasks = self.action_clusterer.cluster(&sig_events, &action_list);
@@ -285,6 +295,24 @@ impl SkillGenerator {
         } else {
             None
         };
+
+        // Step 2.6: Enrich UnitTasks with state diff analysis (before/after screenshots)
+        if let (Some(ref mut tasks), Some(ref rt)) = (&mut unit_tasks, &runtime) {
+            if self.config.use_state_diff && self.config.recording_dir.is_some() {
+                let goal = enriched_recording.metadata.goal.as_deref().unwrap_or("");
+                stats.state_diff_enriched_count = self.enrich_tasks_with_state_diff(tasks, goal, rt);
+            }
+        }
+
+        // Count error corrections (marked by ActionClusterer)
+        if self.config.use_error_correction_filter {
+            if let Some(ref tasks) = unit_tasks {
+                stats.error_correction_count = tasks.iter().filter(|t| t.is_error_correction).count();
+                if stats.error_correction_count > 0 {
+                    info!(count = stats.error_correction_count, "Detected error correction tasks (will be filtered)");
+                }
+            }
+        }
 
         // Step 3: Extract variables
         let variables = if self.config.extract_variables {
@@ -501,6 +529,110 @@ impl SkillGenerator {
         }
 
         enriched
+    }
+
+    /// Enrich UnitTasks with state-diff analysis: load before/after screenshots
+    /// and use the Vision LLM to describe what changed between them.
+    fn enrich_tasks_with_state_diff(
+        &self,
+        tasks: &mut [UnitTask],
+        goal: &str,
+        rt: &tokio::runtime::Runtime,
+    ) -> usize {
+        use crate::synthesis::llm_semantic_synthesis::{LlmSynthesizer, StateDiffContext};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let recording_dir = match self.config.recording_dir.as_ref() {
+            Some(dir) => dir,
+            None => return 0,
+        };
+
+        let screenshots_dir = Recording::screenshots_dir(recording_dir);
+        if !screenshots_dir.exists() {
+            debug!("Screenshots directory not found: {:?}", screenshots_dir);
+            return 0;
+        }
+
+        let api_key = self.config.api_key.clone()
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
+
+        if api_key.is_none() {
+            debug!("No API key available for state diff analysis");
+            return 0;
+        }
+
+        let synthesizer = LlmSynthesizer::with_api_key(api_key.as_deref().unwrap());
+        let mut enriched_count = 0;
+
+        // Cache: deduplicate file reads + base64 encodes across sequential tasks where
+        // Task N's post-screenshot == Task N+1's pre-screenshot.
+        let mut b64_cache: HashMap<std::path::PathBuf, Arc<String>> = HashMap::new();
+
+        let encode_cached = |cache: &mut HashMap<std::path::PathBuf, Arc<String>>, path: &std::path::Path| -> Option<Arc<String>> {
+            if let Some(cached) = cache.get(path) {
+                return Some(Arc::clone(cached));
+            }
+            let data = std::fs::read(path).ok()?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+            let arc = Arc::new(b64);
+            cache.insert(path.to_path_buf(), Arc::clone(&arc));
+            Some(arc)
+        };
+
+        for task in tasks.iter_mut() {
+            let pre_filename = match task.pre_action_screenshot.as_ref() {
+                Some(f) => f,
+                None => continue,
+            };
+            let post_filename = match task.post_action_screenshot.as_ref() {
+                Some(f) => f,
+                None => continue,
+            };
+
+            // Skip if pre and post are the same screenshot (single-event task)
+            if pre_filename == post_filename {
+                continue;
+            }
+
+            let pre_path = screenshots_dir.join(pre_filename);
+            let post_path = screenshots_dir.join(post_filename);
+
+            let pre_b64 = match encode_cached(&mut b64_cache, &pre_path) {
+                Some(b) => b,
+                None => continue,
+            };
+            let post_b64 = match encode_cached(&mut b64_cache, &post_path) {
+                Some(b) => b,
+                None => continue,
+            };
+
+            let context = StateDiffContext {
+                pre_action_b64: Some(pre_b64),
+                post_action_b64: Some(post_b64),
+                goal: goal.to_string(),
+            };
+
+            let action_desc = &task.name;
+            let result = rt.block_on(async {
+                synthesizer.synthesize_with_state_diff(&context, action_desc).await
+            });
+
+            if let Some(enriched_desc) = result {
+                debug!(
+                    "State diff enriched task '{}': {}",
+                    task.name, enriched_desc
+                );
+                task.description = enriched_desc;
+                enriched_count += 1;
+            }
+        }
+
+        if enriched_count > 0 {
+            info!(count = enriched_count, "Enriched UnitTasks with state diff analysis");
+        }
+
+        enriched_count
     }
 
     /// Build a text summary of context events for LLM inference
@@ -1738,6 +1870,10 @@ pub struct PipelineStats {
     pub generated_steps_count: usize,
     /// Number of steps enhanced with screenshot analysis intents
     pub screenshot_enhanced_count: usize,
+    /// Number of UnitTasks enriched with state diff analysis
+    pub state_diff_enriched_count: usize,
+    /// Number of UnitTasks marked as error corrections and filtered out
+    pub error_correction_count: usize,
     /// Pipeline warnings (partial failures, fallbacks)
     pub warnings: Vec<String>,
 }
