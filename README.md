@@ -17,16 +17,17 @@ You record a workflow    →    Replay Skill watches    →    Out comes a SKILL
 (click, type, scroll)         every event + UI context       ready for Claude Code
 ```
 
-1. **Record** — Hit the record button and perform your workflow normally. Replay Skill captures every mouse movement, click, keystroke, and scroll event with microsecond precision.
-2. **Enrich** — Each event is automatically enriched with semantic context: what button you clicked, what text field you typed into, what menu you selected — pulled from the macOS Accessibility API and, when needed, OCR vision fallback.
-3. **Analyze** — A multi-stage pipeline segments your actions into cognitive chunks using GOMS modeling, infers intent using Fitts' Law kinematic analysis, and extracts variables (emails, dates, URLs) for parameterization.
-4. **Generate** — A verified `SKILL.md` file is produced with step-by-step instructions, fallback UI selectors, formal postconditions, and `{{mustache}}` template variables — ready to drop into `~/.claude/skills/`.
+1. **Record** — Hit record and perform your workflow normally. Replay Skill captures every mouse movement, click, keystroke, and scroll event with microsecond precision via a hardened CGEventTap that auto-resurrects if macOS kills it.
+2. **Enrich** — Each event is enriched with semantic context: what button you clicked, what text field you typed into, what menu you selected — pulled from the macOS Accessibility API and, when needed, OCR vision fallback.
+3. **Visual Analysis** — Screenshots are annotated with click dots and kinematic trajectory overlays, then analyzed by Claude Vision to understand UI state. Pre/post action screenshots are diffed to capture what changed on screen.
+4. **Analyze** — A multi-stage pipeline segments your actions into cognitive chunks using GOMS modeling, classifies mouse movements via Fitts' Law kinematic analysis, filters error corrections (undo/retry), and extracts variables for parameterization.
+5. **Generate** — A verified `SKILL.md` file is produced with step-by-step instructions, fallback UI selectors, formal postconditions, and `{{mustache}}` template variables — ready to drop into `~/.claude/skills/`.
 
 ---
 
 ## Download
 
-Go to the [Releases](https://github.com/aezizhu/Replay-Skill/releases) page and download the installer for your platform:
+Go to the [Releases](https://github.com/BvioTech/VioReplay-Skills/releases) page and download the installer for your platform:
 
 | Platform | File | Notes |
 |----------|------|-------|
@@ -37,7 +38,7 @@ Go to the [Releases](https://github.com/aezizhu/Replay-Skill/releases) page and 
 
 ### macOS Installation
 
-1. Download the `.dmg` file for your architecture from [Releases](https://github.com/aezizhu/Replay-Skill/releases).
+1. Download the `.dmg` file for your architecture from [Releases](https://github.com/BvioTech/VioReplay-Skills/releases).
 2. Open the `.dmg` and drag **Replay Skill** into your Applications folder.
 3. On first launch, macOS may show a security warning. Go to **System Settings → Privacy & Security** and click **Open Anyway**.
 4. Grant the required permissions when prompted (see [Permissions](#permissions)).
@@ -64,8 +65,8 @@ After granting permissions, restart the app.
 1. Launch **Replay Skill** from Applications.
 2. Enter an **Anthropic API key** (optional — enables AI-powered skill naming and variable inference).
 3. Type a **goal** describing what you're about to do (e.g., "Create a new invoice for a customer").
-4. Click **Record** and perform your workflow.
-5. Click **Stop** when done.
+4. Click **Record** (or `Cmd+R`) and perform your workflow.
+5. Press **`Ctrl+Option+Cmd+S`** to stop from any app — the hotkey is swallowed at the OS level and never pollutes your recording.
 6. Click **Generate Skill** — a `SKILL.md` file is created and saved to `~/.claude/skills/`.
 7. Use the skill in Claude Code: `/skill-name`
 
@@ -97,11 +98,22 @@ cargo build --release
 - Lock-free SPSC ring buffer — event capture adds <1ms latency to your input
 - Microsecond-precision timestamps via `mach_absolute_time()`
 - Sustained 1000 Hz capture rate with zero event drops
+- **Auto-resurrection** — if macOS kills the event tap via timeout watchdog, it's re-enabled instantly
+- **Global stop hotkey** (`Ctrl+Option+Cmd+S`) — works from any app, swallows the keystroke so it never reaches the target app or pollutes the recording
+
+### Visual Analysis Pipeline
+- **Screenshot capture** at significant events with configurable rate limiting
+- **Click dot annotations** with customizable size and color overlaid on screenshots
+- **Kinematic trajectory overlays** — ballistic vs. searching mouse paths drawn with distinct colors
+- **State diffing** — pre/post action screenshots compared via Claude Vision to detect what changed
+- **Error correction filtering** — undo/retry sequences flow through the full pipeline for LLM state understanding, then get filtered at final SKILL.md assembly
+- **Arc-cached base64 encoding** — zero-copy deduplication when sequential tasks share the same screenshot
 
 ### Semantic Understanding
 - **Accessibility API** integration reads UI element roles, labels, identifiers, and values
 - **Vision fallback** with OCR for opaque UIs (Electron, Chromium, games)
 - **LLM-based context reconstruction** fills gaps when both fail
+- **Dynamic color prompts** — annotation colors are described to the LLM using human-readable names derived from the actual RGB config
 
 ### Intelligent Chunking
 - **GOMS cognitive model** detects natural task boundaries by analyzing hesitation patterns
@@ -129,6 +141,13 @@ The desktop app exposes all pipeline parameters:
 | Model | Claude Opus 4.6 | LLM for semantic synthesis and skill inference |
 | Vision Model | Claude Sonnet 4.5 | LLM for screenshot analysis |
 | Temperature | 0.3 | Lower = more deterministic output |
+| State Diff Analysis | On | Compare pre/post screenshots to detect UI changes |
+| Error Correction Filter | On | Filter undo/retry sequences from final SKILL.md |
+| Dot Radius | 18 px | Click annotation dot size on screenshots |
+| Dot Color | Red | Click annotation dot color (RGB) |
+| Trajectory Colors | Green/Orange | Ballistic vs. searching mouse path colors (RGB) |
+| Trajectory Thickness | 3.0 px | Mouse trajectory line width |
+| Crop Size | 256 px | Foveated crop region around click points |
 
 ---
 
@@ -144,8 +163,8 @@ The desktop app exposes all pipeline parameters:
 ### Build the Desktop App
 
 ```bash
-git clone https://github.com/aezizhu/Replay-Skill.git
-cd Replay-Skill/skill-generator-ui
+git clone https://github.com/BvioTech/VioReplay-Skills.git
+cd VioReplay-Skills/skill-generator-ui
 
 # Install frontend dependencies
 npm install
@@ -157,7 +176,7 @@ npx tauri build
 ### Build the CLI Only
 
 ```bash
-cd Replay-Skill/skill-generator
+cd VioReplay-Skills/skill-generator
 cargo build --release
 # Binary: target/release/skill-gen
 ```
@@ -178,13 +197,23 @@ npx tauri dev
 ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
 │  CGEventTap │───▶│ Ring Buffer │───▶│  Semantic   │───▶│  Recording  │
 │  (capture)  │    │ (lock-free) │    │  Enrichment │    │             │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+└─────────────┘    └─────────────┘    └─────────────┘    └──────┬──────┘
                                                                 │
-                                                                ▼
+                   ┌─────────────┐    ┌─────────────┐          │
+                   │ Screenshot  │───▶│   Vision    │──────────┤
+                   │  Annotator  │    │  Analysis   │          │
+                   └─────────────┘    └─────────────┘          ▼
 ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
 │  SKILL.md   │◀───│  Codegen &  │◀───│  Variable   │◀───│   Intent    │
 │   Output    │    │ Validation  │    │ Extraction  │    │  Inference  │
 └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+       ▲
+  ┌────┴────────┐
+  │ State Diff  │
+  │ + Error     │
+  │ Correction  │
+  │   Filter    │
+  └─────────────┘
 ```
 
 ### Module Overview
@@ -259,6 +288,18 @@ min_pause_ms = 300           # Minimum pause for chunk boundary
 model = "claude-opus-4-6"    # LLM model for synthesis
 temperature = 0.3            # Lower = more deterministic
 include_screenshots = false  # Include screenshots in skill output
+
+[pipeline]
+use_state_diff = true        # Compare pre/post screenshots via Vision
+use_error_correction_filter = true  # Filter undo/retry from final output
+
+[annotation]
+dot_radius = 18              # Click dot size in pixels
+dot_color = [255, 0, 0]      # Click dot RGB color
+trajectory_ballistic_color = [0, 255, 0]   # Confident mouse path color
+trajectory_searching_color = [255, 165, 0] # Searching mouse path color
+trajectory_thickness = 3.0   # Trajectory line width
+crop_size = 256              # Foveated crop region around clicks
 ```
 
 ---
