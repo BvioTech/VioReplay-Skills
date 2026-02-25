@@ -178,6 +178,9 @@ struct EventTapContext {
 // The UnsafeCell<EventProducer> is only accessed in the callback on the CFRunLoop thread.
 unsafe impl Sync for EventTapContext {}
 
+/// Guard against double-initialization: only one EventTap may be active at a time.
+static INSTANCE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// Global context pointer for the callback
 /// This is necessary because CGEventTapCreate's callback can't capture Rust closures
 static CONTEXT_PTR: AtomicPtr<EventTapContext> = AtomicPtr::new(ptr::null_mut());
@@ -220,9 +223,21 @@ impl EventTap {
             return Err(crate::Error::Capture("Event tap already running".into()));
         }
 
+        // Prevent a second EventTap from starting while one is already active
+        if INSTANCE_ACTIVE
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            self.running.store(false, Ordering::SeqCst);
+            return Err(crate::Error::Capture(
+                "Another EventTap instance is already active".into(),
+            ));
+        }
+
         // Check accessibility permissions first
         if !check_accessibility_permissions() {
             self.running.store(false, Ordering::SeqCst);
+            INSTANCE_ACTIVE.store(false, Ordering::SeqCst);
             return Err(crate::Error::Capture(
                 "Accessibility permissions not granted. Please enable in System Preferences > Security & Privacy > Privacy > Accessibility".into()
             ));
@@ -255,6 +270,7 @@ impl EventTap {
                     let _ = Box::from_raw(context_ptr);
                 }
                 CONTEXT_PTR.store(ptr::null_mut(), Ordering::SeqCst);
+                INSTANCE_ACTIVE.store(false, Ordering::SeqCst);
                 crate::Error::Capture(format!("Failed to spawn event tap thread: {}", e))
             })?;
 
@@ -294,6 +310,9 @@ impl EventTap {
         } else {
             info!("Event tap stopped");
         }
+
+        // Release the singleton guard so a new instance can start
+        INSTANCE_ACTIVE.store(false, Ordering::SeqCst);
     }
 
     /// Check if event tap is running
@@ -1046,5 +1065,30 @@ mod tests {
     fn test_get_current_cursor_state() {
         // Should not panic when called
         let _cursor = get_current_cursor_state();
+    }
+
+    #[test]
+    fn test_instance_active_guard_prevents_double_start() {
+        // Simulate an active instance by setting the guard
+        INSTANCE_ACTIVE.store(true, Ordering::SeqCst);
+
+        MachTimebase::init();
+        let mut tap = EventTap::new().unwrap();
+
+        // Create a dummy producer via ring buffer
+        let ring = crate::capture::ring_buffer::EventRingBuffer::with_capacity(16);
+        let (producer, _consumer) = ring.split();
+
+        let result = tap.start(producer);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Another EventTap instance is already active"),
+            "unexpected error: {}",
+            err_msg
+        );
+
+        // Clean up: reset the guard so other tests aren't affected
+        INSTANCE_ACTIVE.store(false, Ordering::SeqCst);
     }
 }

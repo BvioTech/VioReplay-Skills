@@ -232,6 +232,7 @@ fn run_generate(
     let gen_config = skill_generator::workflow::generator::GeneratorConfig {
         api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
         use_llm_semantic: config.codegen.model.contains("claude"),
+        recording_dir: input.parent().map(|p| p.to_path_buf()),
         ..Default::default()
     };
     let generator = SkillGenerator::with_config(gen_config);

@@ -11,6 +11,21 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::{debug, info, warn};
 
+/// Map an RGB triplet to a human-readable color name for LLM prompts.
+fn describe_rgb(r: u8, g: u8, b: u8) -> &'static str {
+    // Dominant-channel heuristic — good enough for distinct annotation colors.
+    let max = r.max(g).max(b);
+    if max < 50 { return "dark"; }
+    if r > 200 && g < 100 && b < 100 { return "red"; }
+    if r < 100 && g > 150 && b < 100 { return "green"; }
+    if r < 100 && g < 100 && b > 150 { return "blue"; }
+    if r > 200 && g > 150 && b < 80 { return "orange"; }
+    if r > 200 && g > 200 && b < 80 { return "yellow"; }
+    if r > 150 && g < 100 && b > 150 { return "purple"; }
+    if r > 200 && g > 200 && b > 200 { return "white"; }
+    "colored"
+}
+
 /// Analysis tier indicating how the intent was determined
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AnalysisTier {
@@ -178,16 +193,22 @@ pub fn run_local_ocr(
     results
 }
 
-/// Build the Claude Vision API request body for a batch of low-confidence screenshots.
+/// Build the Claude Vision API request body for a low-confidence screenshot.
+///
+/// When `annotated` is `Some`, the request includes two images: a marked-up
+/// full screenshot (with red dot + green AX box) and a foveated crop centred
+/// on the interaction point. When `None`, falls back to the single raw image.
 fn build_vision_request(
     analysis: &ScreenshotAnalysis,
     jpeg_data: &[u8],
+    annotated: Option<&crate::semantic::screenshot::AnnotatedScreenshot>,
     event: &EnrichedEvent,
     goal: &str,
     config: &AnalysisConfig,
+    annotation_config: &crate::semantic::screenshot::AnnotationConfig,
 ) -> serde_json::Value {
     use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg_data);
+    let b64_encode = |data: &[u8]| base64::engine::general_purpose::STANDARD.encode(data);
 
     let action_desc = match event.raw.event_type {
         EventType::LeftMouseDown => format!("left click at ({:.0}, {:.0})", event.raw.coordinates.0, event.raw.coordinates.1),
@@ -203,33 +224,90 @@ fn build_vision_request(
         _ => format!("action at ({:.0}, {:.0})", event.raw.coordinates.0, event.raw.coordinates.1),
     };
 
-    let prompt = format!(
-        "Screenshot during macOS workflow. Goal: '{}'. Action: {}. OCR text found: '{}'. \
-         Describe the user's intent in one sentence.",
-        goal,
-        action_desc,
-        analysis.ocr_text.as_deref().unwrap_or("(none)")
-    );
+    // Build content array: two annotated images when available, else one raw image
+    let (content, prompt) = if let Some(ann) = annotated {
+        let full_b64 = b64_encode(&ann.full_jpeg);
+        let crop_b64 = b64_encode(&ann.crop_jpeg);
+
+        // Describe trajectory colors dynamically so the prompt matches whatever the
+        // user has configured in the annotation settings.
+        let [br, bg, bb] = annotation_config.trajectory_ballistic_color;
+        let [sr, sg, sb] = annotation_config.trajectory_searching_color;
+        let ballistic_desc = describe_rgb(br, bg, bb);
+        let searching_desc = describe_rgb(sr, sg, sb);
+
+        let prompt = format!(
+            "Image 1 is the full UI for macro context. The red dot and green box indicate \
+             exactly what the user interacted with. If a colored line is visible, it shows the \
+             mouse trajectory: a {} line means confident, direct movement; a {} line \
+             means the user was searching or hesitating. Image 2 is a high-resolution crop of \
+             that exact interaction point. Goal: '{}'. Action: {}. OCR text: '{}'. \
+             Based on the text/UI elements in Image 2, what is the user clicking and why? \
+             Describe the user's intent in one sentence.",
+            ballistic_desc,
+            searching_desc,
+            goal,
+            action_desc,
+            analysis.ocr_text.as_deref().unwrap_or("(none)")
+        );
+
+        let content = serde_json::json!([
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": full_b64
+                }
+            },
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": crop_b64
+                }
+            },
+            {
+                "type": "text",
+                "text": prompt
+            }
+        ]);
+        (content, prompt)
+    } else {
+        let b64 = b64_encode(jpeg_data);
+        let prompt = format!(
+            "Screenshot during macOS workflow. Goal: '{}'. Action: {}. OCR text found: '{}'. \
+             Describe the user's intent in one sentence.",
+            goal,
+            action_desc,
+            analysis.ocr_text.as_deref().unwrap_or("(none)")
+        );
+        let content = serde_json::json!([
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": b64
+                }
+            },
+            {
+                "type": "text",
+                "text": prompt
+            }
+        ]);
+        (content, prompt)
+    };
+
+    let _ = prompt; // consumed by the json! macro above
 
     serde_json::json!({
         "model": config.claude_model,
         "max_tokens": config.max_tokens,
         "messages": [{
             "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": b64
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": prompt
-                }
-            ]
+            "content": content
         }]
     })
 }
@@ -248,6 +326,7 @@ pub async fn run_claude_vision_analysis(
     goal: &str,
     api_key: &str,
     config: &AnalysisConfig,
+    annotation_config: &crate::semantic::screenshot::AnnotationConfig,
     client: &reqwest::Client,
 ) -> Vec<ScreenshotAnalysis> {
     use std::sync::Arc;
@@ -264,6 +343,15 @@ pub async fn run_claude_vision_analysis(
 
     let semaphore = Arc::new(Semaphore::new(VISION_CONCURRENCY));
     let mut handles = Vec::new();
+
+    // Obtain screen resolution once for coordinate mapping
+    let screen_dims = crate::semantic::screenshot::get_screen_resolution();
+    let ann_config = annotation_config.clone();
+
+    // Pre-compute trajectory overlays for each click event
+    let rdp = crate::analysis::rdp_simplification::RdpSimplifier::default();
+    let kinematic = crate::analysis::kinematic_segmentation::KinematicSegmenter::default();
+    let trajectory_map = build_trajectory_map(events, &rdp, &kinematic);
 
     for analysis in low_confidence {
         let analysis_owned = analysis.clone();
@@ -285,7 +373,22 @@ pub async fn run_claude_vision_analysis(
             }
         };
 
-        let body = build_vision_request(analysis, &jpeg_data, &event, goal, config);
+        // Look up pre-computed trajectory for this event
+        let trajectory = trajectory_map.get(&analysis.sequence);
+
+        // Annotate: red dot at click point, green AX bounding box, trajectory, foveated crop
+        let ax_frame = event.semantic.as_ref().and_then(|s| s.frame);
+        let annotated = crate::semantic::screenshot::annotate_screenshot(
+            &jpeg_data,
+            event.raw.coordinates.0,
+            event.raw.coordinates.1,
+            screen_dims,
+            ax_frame,
+            trajectory,
+            &ann_config,
+        );
+
+        let body = build_vision_request(analysis, &jpeg_data, annotated.as_ref(), &event, goal, config, &ann_config);
         let analysis_clone = analysis.clone();
         let client = client.clone();
         let api_key = api_key.to_string();
@@ -365,6 +468,7 @@ pub fn analyze_recording(
     recording: &Recording,
     api_key: Option<&str>,
     config: &AnalysisConfig,
+    annotation_config: &crate::semantic::screenshot::AnnotationConfig,
 ) -> RecordingAnalysis {
     let screenshots_dir = Recording::screenshots_dir(recording_dir);
 
@@ -427,6 +531,7 @@ pub fn analyze_recording(
                     goal,
                     key,
                     config,
+                    annotation_config,
                     &client,
                 ));
 
@@ -463,6 +568,74 @@ pub fn load_analysis(recording_dir: &Path) -> std::io::Result<RecordingAnalysis>
     let content = std::fs::read_to_string(path)?;
     serde_json::from_str(&content)
         .map_err(std::io::Error::other)
+}
+
+/// Build a map of sequence → TrajectoryOverlay for each click event.
+///
+/// For each click, extracts the preceding mouse-move events, simplifies with
+/// RDP, classifies via kinematic segmentation, and produces a trajectory overlay
+/// with screen-coordinate points and movement pattern.
+fn build_trajectory_map(
+    events: &[EnrichedEvent],
+    rdp: &crate::analysis::rdp_simplification::RdpSimplifier,
+    kinematic: &crate::analysis::kinematic_segmentation::KinematicSegmenter,
+) -> std::collections::HashMap<u64, crate::semantic::screenshot::TrajectoryOverlay> {
+    use crate::analysis::kinematic_segmentation::MovementPattern;
+
+    let mut map = std::collections::HashMap::new();
+
+    // Find click event indices
+    let click_indices: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.raw.event_type.is_click())
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut prev_click_idx = 0;
+
+    for &click_idx in &click_indices {
+        let start = if click_idx > prev_click_idx { prev_click_idx } else { 0 };
+
+        // Extract mouse-move + click events in the segment
+        let segment_raw: Vec<crate::capture::types::RawEvent> = events[start..=click_idx]
+            .iter()
+            .filter(|e| e.raw.event_type.is_mouse_move() || e.raw.event_type.is_click())
+            .map(|e| e.raw.clone())
+            .collect();
+
+        prev_click_idx = click_idx + 1;
+
+        if segment_raw.len() < 3 {
+            continue;
+        }
+
+        let simplified = rdp.simplify_events(&segment_raw);
+        if simplified.len() < 2 {
+            continue;
+        }
+
+        let analysis = kinematic.analyze(&simplified);
+
+        // Skip stationary patterns — no visible trajectory to draw
+        if analysis.pattern == MovementPattern::Stationary {
+            continue;
+        }
+
+        // Convert simplified trajectory points to screen coordinates
+        let points: Vec<(f64, f64)> = simplified
+            .iter()
+            .map(|pt| (pt.x, pt.y))
+            .collect();
+
+        let sequence = events[click_idx].sequence;
+        map.insert(sequence, crate::semantic::screenshot::TrajectoryOverlay {
+            points,
+            pattern: analysis.pattern,
+        });
+    }
+
+    map
 }
 
 #[cfg(test)]
@@ -594,9 +767,11 @@ mod tests {
         };
 
         let config = AnalysisConfig::default();
+        let ann_config = crate::semantic::screenshot::AnnotationConfig::default();
         let jpeg_data = vec![0xFF, 0xD8, 0xFF, 0xE0]; // Minimal JPEG header
 
-        let body = build_vision_request(&analysis, &jpeg_data, &event, "Test goal", &config);
+        // Test without annotation (fallback path)
+        let body = build_vision_request(&analysis, &jpeg_data, None, &event, "Test goal", &config, &ann_config);
 
         // Verify structure
         assert_eq!(body["model"], "claude-haiku-4-5-20250929");

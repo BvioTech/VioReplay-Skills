@@ -27,6 +27,13 @@ pub struct UnitTask {
     pub nesting_level: usize,
     /// Parent task ID (if nested)
     pub parent_id: Option<uuid::Uuid>,
+    /// Screenshot filename captured at the start of this action cluster (State A / before)
+    pub pre_action_screenshot: Option<String>,
+    /// Screenshot filename captured at the end of this action cluster (State B / after)
+    pub post_action_screenshot: Option<String>,
+    /// Whether this task represents an error correction (undo, cancel, retype) that
+    /// should be excluded from the generated SKILL.md.
+    pub is_error_correction: bool,
 }
 
 /// Configuration for action clustering
@@ -202,6 +209,9 @@ impl ActionClusterer {
         // Filter out micro-operations
         tasks = self.filter_micro_operations(tasks);
 
+        // Mark error-correction patterns (undo, cancel, retype)
+        Self::mark_error_corrections(&mut tasks);
+
         tasks
     }
 
@@ -286,6 +296,9 @@ impl ActionClusterer {
             end_time: last.raw.timestamp.ticks(),
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: events.first().and_then(|e| e.screenshot_filename.clone()),
+            post_action_screenshot: events.last().and_then(|e| e.screenshot_filename.clone()),
+            is_error_correction: false,
         })
     }
 
@@ -470,6 +483,105 @@ impl ActionClusterer {
             end_time: t2.end_time,
             nesting_level: t1.nesting_level,
             parent_id: t1.parent_id,
+            pre_action_screenshot: t1.events.first().and_then(|e| e.screenshot_filename.clone()),
+            post_action_screenshot: t2.events.last().and_then(|e| e.screenshot_filename.clone()),
+            is_error_correction: false,
+        }
+    }
+
+    /// Mark tasks that represent error corrections so they can be filtered from
+    /// the generated SKILL.md. Detects:
+    ///
+    /// 1. **Standalone undo** — a Cmd+Z shortcut task
+    /// 2. **Type-then-undo** — typing followed immediately by Cmd+Z
+    /// 3. **Open-then-cancel** — a click followed immediately by Escape
+    /// 4. **Backspace-only typing** — keyboard task where all characters are deletions
+    fn mark_error_corrections(tasks: &mut [UnitTask]) {
+        let len = tasks.len();
+
+        for i in 0..len {
+            // Pattern 1: Standalone Cmd+Z (undo)
+            if Self::is_undo_shortcut(&tasks[i]) {
+                tasks[i].is_error_correction = true;
+                continue;
+            }
+
+            // Pattern 2: Type-then-undo — mark both tasks
+            if i + 1 < len
+                && matches!(tasks[i].primary_action, Action::Type { .. } | Action::Fill { .. })
+                && Self::is_undo_shortcut(&tasks[i + 1])
+            {
+                tasks[i].is_error_correction = true;
+                tasks[i + 1].is_error_correction = true;
+                continue;
+            }
+
+            // Pattern 3: Click-then-escape (open menu/dialog then cancel)
+            if i + 1 < len
+                && matches!(tasks[i].primary_action, Action::Click { .. })
+                && Self::is_escape_shortcut(&tasks[i + 1])
+            {
+                tasks[i].is_error_correction = true;
+                tasks[i + 1].is_error_correction = true;
+                continue;
+            }
+
+            // Pattern 4: Backspace-only keyboard task (all deletions, no meaningful output)
+            if Self::is_backspace_only(&tasks[i]) {
+                tasks[i].is_error_correction = true;
+            }
+        }
+    }
+
+    /// Check if a task is a Cmd+Z (undo) shortcut.
+    fn is_undo_shortcut(task: &UnitTask) -> bool {
+        if let Action::Shortcut { keys, .. } = &task.primary_action {
+            let has_cmd = keys.iter().any(|k| {
+                let lower = k.to_lowercase();
+                lower == "command" || lower == "cmd"
+            });
+            let has_z = keys.iter().any(|k| k.to_lowercase() == "z");
+            has_cmd && has_z
+        } else {
+            false
+        }
+    }
+
+    /// Check if a task is an Escape-only shortcut (cancel).
+    fn is_escape_shortcut(task: &UnitTask) -> bool {
+        if let Action::Shortcut { keys, .. } = &task.primary_action {
+            keys.len() == 1
+                && keys.iter().any(|k| {
+                    let lower = k.to_lowercase();
+                    lower == "escape" || lower == "esc"
+                })
+        } else {
+            false
+        }
+    }
+
+    /// Check if a task consists entirely of backspace/delete key events with no
+    /// meaningful text output — i.e., the user is only deleting.
+    fn is_backspace_only(task: &UnitTask) -> bool {
+        if let Action::Type { text, .. } = &task.primary_action {
+            // If the typed "text" is only backspace characters or empty, it's correction
+            text.chars().all(|c| c == '\u{8}' || c == '\u{7f}')
+        } else {
+            // Check raw events for backspace-dominated keyboard sequences
+            let mut backspace_count = 0u32;
+            let mut char_count = 0u32;
+            for event in &task.events {
+                if event.raw.event_type.is_keyboard() {
+                    if let Some(ch) = event.raw.character {
+                        if ch == '\u{8}' || ch == '\u{7f}' {
+                            backspace_count += 1;
+                        } else if !ch.is_control() {
+                            char_count += 1;
+                        }
+                    }
+                }
+            }
+            backspace_count >= 3 && char_count == 0
         }
     }
 
@@ -571,6 +683,9 @@ mod tests {
             end_time: 2000,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         assert_eq!(task.name, "Click Submit");
@@ -597,6 +712,9 @@ mod tests {
             end_time: 2000,
             nesting_level: 1,
             parent_id: Some(parent_id),
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         assert_eq!(task.nesting_level, 1);
@@ -823,6 +941,9 @@ mod tests {
                 end_time: 1100,
                 nesting_level: 0,
                 parent_id: None,
+                pre_action_screenshot: None,
+                post_action_screenshot: None,
+                is_error_correction: false,
             },
             UnitTask {
                 id: uuid::Uuid::new_v4(),
@@ -837,6 +958,9 @@ mod tests {
                 end_time: 2100,
                 nesting_level: 0,
                 parent_id: None,
+                pre_action_screenshot: None,
+                post_action_screenshot: None,
+                is_error_correction: false,
             },
         ];
 
@@ -868,6 +992,9 @@ mod tests {
             end_time: 1100,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         let t2 = UnitTask {
@@ -880,6 +1007,9 @@ mod tests {
             end_time: 1300,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         assert!(clusterer.is_dropdown_pattern(&t1, &t2));
@@ -899,6 +1029,9 @@ mod tests {
             end_time: 1100,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         let t2 = UnitTask {
@@ -911,6 +1044,9 @@ mod tests {
             end_time: 1300,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         assert!(!clusterer.is_dropdown_pattern(&t1, &t2));
@@ -930,6 +1066,9 @@ mod tests {
             end_time: 1100,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         let t2 = UnitTask {
@@ -942,6 +1081,9 @@ mod tests {
             end_time: 1300,
             nesting_level: 0,
             parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
         };
 
         let merged = clusterer.merge_dropdown(&t1, &t2);
@@ -1104,5 +1246,136 @@ mod tests {
     fn test_validate_zero_movement_is_ok() {
         let config = ClusteringConfig { min_movement_px: 0.0, ..Default::default() };
         assert!(config.validate().is_empty());
+    }
+
+    // -- Error correction detection tests --
+
+    fn make_shortcut_task(keys: &[&str]) -> UnitTask {
+        UnitTask {
+            id: uuid::Uuid::new_v4(),
+            name: format!("Press {}", keys.join("+")),
+            description: "shortcut".to_string(),
+            primary_action: Action::Shortcut {
+                keys: keys.iter().map(|k| k.to_string()).collect(),
+                confidence: 0.9,
+            },
+            events: vec![make_enriched_event(1000, EventType::KeyDown, 0.0, 0.0)],
+            start_time: 1000,
+            end_time: 1100,
+            nesting_level: 0,
+            parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
+        }
+    }
+
+    fn make_type_task(text: &str) -> UnitTask {
+        UnitTask {
+            id: uuid::Uuid::new_v4(),
+            name: "Type text".to_string(),
+            description: "type".to_string(),
+            primary_action: Action::Type {
+                text: text.to_string(),
+                confidence: 0.9,
+            },
+            events: vec![make_enriched_event(1000, EventType::KeyDown, 0.0, 0.0)],
+            start_time: 1000,
+            end_time: 1100,
+            nesting_level: 0,
+            parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
+        }
+    }
+
+    fn make_simple_click_task(name: &str) -> UnitTask {
+        UnitTask {
+            id: uuid::Uuid::new_v4(),
+            name: format!("Click {}", name),
+            description: "click".to_string(),
+            primary_action: make_click_action(name),
+            events: vec![make_enriched_event(1000, EventType::LeftMouseDown, 100.0, 100.0)],
+            start_time: 1000,
+            end_time: 1100,
+            nesting_level: 0,
+            parent_id: None,
+            pre_action_screenshot: None,
+            post_action_screenshot: None,
+            is_error_correction: false,
+        }
+    }
+
+    #[test]
+    fn test_mark_error_corrections_standalone_undo() {
+        let mut tasks = vec![
+            make_simple_click_task("Submit"),
+            make_shortcut_task(&["command", "z"]),
+        ];
+        ActionClusterer::mark_error_corrections(&mut tasks);
+        assert!(!tasks[0].is_error_correction);
+        assert!(tasks[1].is_error_correction);
+    }
+
+    #[test]
+    fn test_mark_error_corrections_type_then_undo() {
+        let mut tasks = vec![
+            make_type_task("hello"),
+            make_shortcut_task(&["cmd", "z"]),
+        ];
+        ActionClusterer::mark_error_corrections(&mut tasks);
+        assert!(tasks[0].is_error_correction, "type task should be marked");
+        assert!(tasks[1].is_error_correction, "undo task should be marked");
+    }
+
+    #[test]
+    fn test_mark_error_corrections_click_then_escape() {
+        let mut tasks = vec![
+            make_simple_click_task("Menu"),
+            make_shortcut_task(&["escape"]),
+        ];
+        ActionClusterer::mark_error_corrections(&mut tasks);
+        assert!(tasks[0].is_error_correction, "click task should be marked");
+        assert!(tasks[1].is_error_correction, "escape task should be marked");
+    }
+
+    #[test]
+    fn test_mark_error_corrections_backspace_only() {
+        let mut tasks = vec![
+            make_type_task("\u{8}\u{8}\u{8}"),  // 3 backspaces
+        ];
+        ActionClusterer::mark_error_corrections(&mut tasks);
+        assert!(tasks[0].is_error_correction);
+    }
+
+    #[test]
+    fn test_mark_error_corrections_normal_typing_not_marked() {
+        let mut tasks = vec![
+            make_type_task("hello world"),
+        ];
+        ActionClusterer::mark_error_corrections(&mut tasks);
+        assert!(!tasks[0].is_error_correction);
+    }
+
+    #[test]
+    fn test_mark_error_corrections_normal_shortcut_not_marked() {
+        let mut tasks = vec![
+            make_shortcut_task(&["command", "s"]),  // Cmd+S save — not undo
+        ];
+        ActionClusterer::mark_error_corrections(&mut tasks);
+        assert!(!tasks[0].is_error_correction);
+    }
+
+    #[test]
+    fn test_mark_error_corrections_escape_without_preceding_click() {
+        let mut tasks = vec![
+            make_type_task("hello"),
+            make_shortcut_task(&["escape"]),
+        ];
+        ActionClusterer::mark_error_corrections(&mut tasks);
+        // Escape after typing is NOT an error pattern (no click-then-escape)
+        assert!(!tasks[0].is_error_correction);
+        assert!(!tasks[1].is_error_correction);
     }
 }
