@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use skill_generator::app::config::Config;
-use skill_generator::capture::event_tap::{check_accessibility_permissions, check_screen_recording_permission};
+use skill_generator::capture::event_tap::{check_accessibility_permissions, check_screen_recording_permission, was_hotkey_stopped};
 use skill_generator::capture::ring_buffer::{EventRingBuffer, DEFAULT_CAPACITY};
 use skill_generator::time::timebase::MachTimebase;
 use skill_generator::workflow::generator::SkillGenerator;
@@ -196,6 +196,8 @@ pub struct RecordingStatus {
     pub duration_seconds: f64,
     pub has_accessibility: bool,
     pub has_screen_recording: bool,
+    /// True when recording was stopped by the global hotkey (Cmd+Opt+Ctrl+S)
+    pub hotkey_stopped: bool,
 }
 
 /// Pipeline statistics for the frontend
@@ -427,6 +429,7 @@ fn get_recording_status(state: State<AppState>) -> Result<RecordingStatus, Strin
             duration_seconds: 0.0,
             has_accessibility: check_accessibility_permissions(),
             has_screen_recording: check_screen_recording_permission(),
+            hotkey_stopped: false,
         });
     }
 
@@ -516,6 +519,7 @@ fn get_recording_status(state: State<AppState>) -> Result<RecordingStatus, Strin
         duration_seconds: duration,
         has_accessibility: check_accessibility_permissions(),
         has_screen_recording: check_screen_recording_permission(),
+        hotkey_stopped: was_hotkey_stopped(),
     })
 }
 
@@ -558,6 +562,11 @@ fn stop_recording(state: State<AppState>) -> Result<RecordingInfo, String> {
             let batch = cons.pop_batch(STOP_DRAIN_BATCH_SIZE);
             for slot in batch {
                 rec.add_raw_event(slot.event);
+            }
+            // Trim trailing FlagsChanged events caused by the stop hotkey modifier keys
+            // (Cmd/Opt/Ctrl pressed before 'S'). These are recording pollution.
+            while rec.events.last().is_some_and(|e| e.raw.event_type == EventType::FlagsChanged) {
+                rec.events.pop();
             }
             // Mark recording as having screenshots
             if had_screenshots {

@@ -9,6 +9,7 @@ interface RecordingStatus {
   duration_seconds: number;
   has_accessibility: boolean;
   has_screen_recording: boolean;
+  hotkey_stopped: boolean;
 }
 
 interface RecordingInfo {
@@ -396,6 +397,11 @@ function App() {
       setDuration(status.duration_seconds);
       setHasAccessibility(status.has_accessibility);
       setHasScreenRecording(status.has_screen_recording);
+
+      // Auto-stop when global hotkey (Cmd+Opt+Ctrl+S) was pressed
+      if (status.hotkey_stopped && status.is_recording) {
+        handleStopRecording();
+      }
     } catch (e) {
       console.error("Failed to get status:", e);
     }
@@ -971,7 +977,7 @@ function App() {
 
                 <button className="btn btn-stop btn-full" onClick={handleStopRecording}>
                   Stop Recording
-                  <span className="shortcut-hint">ESC</span>
+                  <span className="shortcut-hint">&#8963;&#8997;&#8984;S</span>
                 </button>
               </>
             ) : (

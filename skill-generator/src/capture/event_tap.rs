@@ -186,6 +186,20 @@ static INSTANCE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CONTEXT_PTR: AtomicPtr<EventTapContext> = AtomicPtr::new(ptr::null_mut());
 static RUN_LOOP_PTR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
+/// Tap handle for re-enabling after macOS timeout kills (kCGEventTapDisabledByTimeout)
+static EVENT_TAP_PTR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+
+/// Set to true when the global stop hotkey (Cmd+Opt+Ctrl+S) fires inside the callback.
+/// The Tauri backend polls this via `was_hotkey_stopped()` to trigger the normal stop flow.
+static HOTKEY_STOPPED: AtomicBool = AtomicBool::new(false);
+
+/// macOS sentinel event types for disabled taps
+const CG_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFFFFFE;
+const CG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFFFFFF;
+
+/// Global stop hotkey: Cmd + Option + Ctrl + S  (virtual keycode 1 = 'S')
+const STOP_HOTKEY_KEYCODE: i64 = 1;
+
 /// Quartz Event Tap for capturing user interactions
 pub struct EventTap {
     /// Thread handle for the run loop
@@ -233,6 +247,9 @@ impl EventTap {
                 "Another EventTap instance is already active".into(),
             ));
         }
+
+        // Reset hotkey stop flag from any previous session
+        HOTKEY_STOPPED.store(false, Ordering::SeqCst);
 
         // Check accessibility permissions first
         if !check_accessibility_permissions() {
@@ -344,6 +361,22 @@ extern "C" fn event_tap_callback(
     event: CGEventRef,
     _user_info: *mut c_void,
 ) -> CGEventRef {
+    // --- FIX 1: Resurrect tap after macOS watchdog timeout ---
+    // If the callback takes >250ms, macOS silently disables the tap.
+    // We detect this and re-enable immediately.
+    if event_type == CG_EVENT_TAP_DISABLED_BY_TIMEOUT
+        || event_type == CG_EVENT_TAP_DISABLED_BY_USER_INPUT
+    {
+        tracing::warn!("macOS disabled the event tap (type=0x{:X}), re-enabling", event_type);
+        let tap = EVENT_TAP_PTR.load(Ordering::SeqCst);
+        if !tap.is_null() {
+            unsafe {
+                CGEventTapEnable(tap as CFTypeRef, true);
+            }
+        }
+        return event;
+    }
+
     // Get context
     let ctx = CONTEXT_PTR.load(Ordering::SeqCst);
     if ctx.is_null() {
@@ -355,6 +388,37 @@ extern "C" fn event_tap_callback(
     // Check if we should stop
     if !context.running.load(Ordering::Relaxed) {
         return event;
+    }
+
+    // --- FIX 2: Global stop hotkey (Cmd+Opt+Ctrl+S) ---
+    // Intercept and swallow the keystroke so it never reaches the target app
+    // or pollutes the recording.
+    if event_type == CG_EVENT_KEY_DOWN {
+        let flags = unsafe { CGEventGetFlags(event) };
+        let keycode = unsafe { CGEventGetIntegerValueField(event, CG_KEYBOARD_EVENT_KEYCODE) };
+
+        let has_cmd = flags & CG_EVENT_FLAG_MASK_COMMAND != 0;
+        let has_opt = flags & CG_EVENT_FLAG_MASK_ALTERNATE != 0;
+        let has_ctrl = flags & CG_EVENT_FLAG_MASK_CONTROL != 0;
+
+        if keycode == STOP_HOTKEY_KEYCODE && has_cmd && has_opt && has_ctrl {
+            info!("Global stop hotkey detected (Cmd+Opt+Ctrl+S), stopping recording");
+
+            // Signal stop
+            context.running.store(false, Ordering::SeqCst);
+            HOTKEY_STOPPED.store(true, Ordering::SeqCst);
+
+            // Stop the CFRunLoop so the tap thread exits cleanly
+            let run_loop = RUN_LOOP_PTR.load(Ordering::SeqCst);
+            if !run_loop.is_null() {
+                unsafe {
+                    CFRunLoopStop(run_loop as _);
+                }
+            }
+
+            // Swallow the keystroke — return null so the target app never sees it
+            return ptr::null() as CGEventRef;
+        }
     }
 
     // Convert event type
@@ -431,7 +495,7 @@ extern "C" fn event_tap_callback(
         trace!("Ring buffer full, dropping event");
     }
 
-    // Return the event unchanged (we're listen-only)
+    // Return the event unchanged (passthrough to target app)
     event
 }
 
@@ -474,12 +538,14 @@ fn run_event_tap_loop(_running: Arc<AtomicBool>) -> Result<(), crate::Error> {
     // Create event mask for all events we want
     let event_mask = create_event_mask();
 
-    // Create the event tap
+    // Create the event tap.
+    // DefaultTap (active filter) so we can swallow the stop hotkey by returning null.
+    // For all other events we return the event unchanged (passthrough).
     let tap = unsafe {
         CGEventTapCreate(
             CGEventTapLocation::SessionEventTap,
             CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::ListenOnly,
+            CGEventTapOptions::DefaultTap,
             event_mask,
             event_tap_callback,
             ptr::null_mut(),
@@ -491,6 +557,9 @@ fn run_event_tap_loop(_running: Arc<AtomicBool>) -> Result<(), crate::Error> {
             "Failed to create event tap. Ensure accessibility permissions are granted.".into(),
         ));
     }
+
+    // Store tap handle so the callback can re-enable it after macOS timeout kills
+    EVENT_TAP_PTR.store(tap as *mut c_void, Ordering::SeqCst);
 
     // RAII guard: disables and releases tap on any exit (including panic)
     let _tap_guard = EventTapGuard(tap);
@@ -533,6 +602,9 @@ fn run_event_tap_loop(_running: Arc<AtomicBool>) -> Result<(), crate::Error> {
     unsafe {
         CFRunLoopRun();
     }
+
+    // Clear the tap pointer before guards run Drop (which releases the tap)
+    EVENT_TAP_PTR.store(ptr::null_mut(), Ordering::SeqCst);
 
     // Guards handle cleanup automatically via Drop
 
@@ -604,6 +676,14 @@ pub fn request_accessibility_permissions() -> bool {
     let options = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), value.as_CFType())]);
 
     unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef() as CFTypeRef) }
+}
+
+/// Returns `true` (and resets the flag) if the global stop hotkey fired during recording.
+///
+/// Call this from the Tauri status-polling loop to detect when the user stopped
+/// recording via the OS-level hotkey (Cmd+Opt+Ctrl+S).
+pub fn was_hotkey_stopped() -> bool {
+    HOTKEY_STOPPED.swap(false, Ordering::SeqCst)
 }
 
 /// Check if screen recording permission is granted (macOS 10.15+).
