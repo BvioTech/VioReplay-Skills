@@ -22,10 +22,12 @@ pub struct SynthesisResult {
 /// Context for before/after state diffing — carries image pairs for LLM analysis.
 #[derive(Debug, Clone)]
 pub struct StateDiffContext {
-    /// JPEG bytes of the screenshot before the action (State A)
-    pub pre_action_jpeg: Option<Vec<u8>>,
-    /// JPEG bytes of the screenshot after the action (State B)
-    pub post_action_jpeg: Option<Vec<u8>>,
+    /// Base64-encoded JPEG of the screenshot before the action (State A).
+    /// Wrapped in Arc to allow cheap sharing across sequential task boundaries
+    /// (Task N's post = Task N+1's pre).
+    pub pre_action_b64: Option<std::sync::Arc<String>>,
+    /// Base64-encoded JPEG of the screenshot after the action (State B).
+    pub post_action_b64: Option<std::sync::Arc<String>>,
     /// The recording's goal for context
     pub goal: String,
 }
@@ -361,14 +363,9 @@ Respond in JSON format:
         context: &StateDiffContext,
         action_description: &str,
     ) -> Option<String> {
-        use base64::Engine;
-
         let api_key = self.api_key.as_ref()?;
-        let pre_jpeg = context.pre_action_jpeg.as_ref()?;
-        let post_jpeg = context.post_action_jpeg.as_ref()?;
-
-        let pre_b64 = base64::engine::general_purpose::STANDARD.encode(pre_jpeg);
-        let post_b64 = base64::engine::general_purpose::STANDARD.encode(post_jpeg);
+        let pre_b64 = context.pre_action_b64.as_ref()?;
+        let post_b64 = context.post_action_b64.as_ref()?;
 
         let prompt = format!(
             "Image A is the UI state before the user acted. Image B is the state after. \
@@ -395,7 +392,7 @@ Respond in JSON format:
                         "source": {
                             "type": "base64",
                             "media_type": "image/jpeg",
-                            "data": pre_b64
+                            "data": pre_b64.as_str()
                         }
                     },
                     {
@@ -403,7 +400,7 @@ Respond in JSON format:
                         "source": {
                             "type": "base64",
                             "media_type": "image/jpeg",
-                            "data": post_b64
+                            "data": post_b64.as_str()
                         }
                     },
                     {
@@ -825,32 +822,32 @@ mod tests {
     #[test]
     fn test_state_diff_context_creation() {
         let ctx = StateDiffContext {
-            pre_action_jpeg: Some(vec![0xFF, 0xD8]),
-            post_action_jpeg: Some(vec![0xFF, 0xD8]),
+            pre_action_b64: Some(std::sync::Arc::new("/9j".to_string())),
+            post_action_b64: Some(std::sync::Arc::new("/9j".to_string())),
             goal: "Test goal".to_string(),
         };
-        assert!(ctx.pre_action_jpeg.is_some());
-        assert!(ctx.post_action_jpeg.is_some());
+        assert!(ctx.pre_action_b64.is_some());
+        assert!(ctx.post_action_b64.is_some());
         assert_eq!(ctx.goal, "Test goal");
     }
 
     #[test]
     fn test_state_diff_context_empty() {
         let ctx = StateDiffContext {
-            pre_action_jpeg: None,
-            post_action_jpeg: None,
+            pre_action_b64: None,
+            post_action_b64: None,
             goal: String::new(),
         };
-        assert!(ctx.pre_action_jpeg.is_none());
-        assert!(ctx.post_action_jpeg.is_none());
+        assert!(ctx.pre_action_b64.is_none());
+        assert!(ctx.post_action_b64.is_none());
     }
 
     #[tokio::test]
     async fn test_synthesize_with_state_diff_no_api_key() {
         let synth = LlmSynthesizer::new();
         let ctx = StateDiffContext {
-            pre_action_jpeg: Some(vec![0xFF, 0xD8]),
-            post_action_jpeg: Some(vec![0xFF, 0xD8]),
+            pre_action_b64: Some(std::sync::Arc::new("/9j".to_string())),
+            post_action_b64: Some(std::sync::Arc::new("/9j".to_string())),
             goal: "Test".to_string(),
         };
         // Without API key, should return None
@@ -863,8 +860,8 @@ mod tests {
         let mut synth = LlmSynthesizer::new();
         synth.api_key = Some("test-key".to_string());
         let ctx = StateDiffContext {
-            pre_action_jpeg: None,
-            post_action_jpeg: Some(vec![0xFF, 0xD8]),
+            pre_action_b64: None,
+            post_action_b64: Some(std::sync::Arc::new("/9j".to_string())),
             goal: "Test".to_string(),
         };
         // Missing pre-action image should return None

@@ -107,6 +107,8 @@ pub struct CompilerConfig {
     pub temperature: f32,
     /// Whether to include screenshots
     pub include_screenshots: bool,
+    /// Whether to filter out error correction tasks from the final SKILL.md
+    pub filter_error_corrections: bool,
 }
 
 impl Default for CompilerConfig {
@@ -115,6 +117,7 @@ impl Default for CompilerConfig {
             semantic_model: "claude-sonnet-4-5-20250929".to_string(),
             temperature: 0.3,
             include_screenshots: false,
+            filter_error_corrections: true,
         }
     }
 }
@@ -146,19 +149,26 @@ impl SkillCompiler {
         variables: &[ExtractedVariable],
     ) -> CompiledSkill {
         // Pre-filter: remove error correction tasks (undo, cancel, backspace-only)
-        let filtered_tasks: Vec<&UnitTask> = tasks
-            .iter()
-            .filter(|t| !t.is_error_correction)
-            .collect();
-        let error_correction_count = tasks.len() - filtered_tasks.len();
-        if error_correction_count > 0 {
-            tracing::debug!(
-                count = error_correction_count,
-                "Filtered error correction tasks from skill compilation"
-            );
-        }
-        let tasks: Vec<UnitTask> = filtered_tasks.into_iter().cloned().collect();
-        let tasks = tasks.as_slice();
+        // Only filter when the user has the toggle enabled; if disabled, error
+        // corrections are emitted into the SKILL.md as normal steps.
+        let owned_tasks: Vec<UnitTask>;
+        let tasks = if self.config.filter_error_corrections {
+            let filtered: Vec<&UnitTask> = tasks
+                .iter()
+                .filter(|t| !t.is_error_correction)
+                .collect();
+            let error_correction_count = tasks.len() - filtered.len();
+            if error_correction_count > 0 {
+                tracing::debug!(
+                    count = error_correction_count,
+                    "Filtered error correction tasks from skill compilation"
+                );
+            }
+            owned_tasks = filtered.into_iter().cloned().collect();
+            owned_tasks.as_slice()
+        } else {
+            tasks
+        };
 
         // Pass 1: Generate semantic narratives
         let narratives = self.pass_semantic(tasks);
@@ -877,6 +887,7 @@ mod tests {
             semantic_model: "custom-model".to_string(),
             temperature: 0.5,
             include_screenshots: true,
+            filter_error_corrections: true,
         };
 
         let compiler = SkillCompiler::with_config(custom_config);

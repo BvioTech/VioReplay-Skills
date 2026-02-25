@@ -4,6 +4,7 @@
 //! selector ranking, and verification blocks.
 
 use super::recording::Recording;
+use base64::Engine;
 use crate::analysis::intent_binding::{Action, ScrollDirection};
 use crate::analysis::kinematic_segmentation::{KinematicSegmenter, MovementPattern};
 use crate::analysis::rdp_simplification::RdpSimplifier;
@@ -539,6 +540,8 @@ impl SkillGenerator {
         rt: &tokio::runtime::Runtime,
     ) -> usize {
         use crate::synthesis::llm_semantic_synthesis::{LlmSynthesizer, StateDiffContext};
+        use std::collections::HashMap;
+        use std::sync::Arc;
 
         let recording_dir = match self.config.recording_dir.as_ref() {
             Some(dir) => dir,
@@ -562,6 +565,21 @@ impl SkillGenerator {
         let synthesizer = LlmSynthesizer::with_api_key(api_key.as_deref().unwrap());
         let mut enriched_count = 0;
 
+        // Cache: deduplicate file reads + base64 encodes across sequential tasks where
+        // Task N's post-screenshot == Task N+1's pre-screenshot.
+        let mut b64_cache: HashMap<std::path::PathBuf, Arc<String>> = HashMap::new();
+
+        let encode_cached = |cache: &mut HashMap<std::path::PathBuf, Arc<String>>, path: &std::path::Path| -> Option<Arc<String>> {
+            if let Some(cached) = cache.get(path) {
+                return Some(Arc::clone(cached));
+            }
+            let data = std::fs::read(path).ok()?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+            let arc = Arc::new(b64);
+            cache.insert(path.to_path_buf(), Arc::clone(&arc));
+            Some(arc)
+        };
+
         for task in tasks.iter_mut() {
             let pre_filename = match task.pre_action_screenshot.as_ref() {
                 Some(f) => f,
@@ -580,18 +598,18 @@ impl SkillGenerator {
             let pre_path = screenshots_dir.join(pre_filename);
             let post_path = screenshots_dir.join(post_filename);
 
-            let pre_jpeg = match std::fs::read(&pre_path) {
-                Ok(data) => data,
-                Err(_) => continue,
+            let pre_b64 = match encode_cached(&mut b64_cache, &pre_path) {
+                Some(b) => b,
+                None => continue,
             };
-            let post_jpeg = match std::fs::read(&post_path) {
-                Ok(data) => data,
-                Err(_) => continue,
+            let post_b64 = match encode_cached(&mut b64_cache, &post_path) {
+                Some(b) => b,
+                None => continue,
             };
 
             let context = StateDiffContext {
-                pre_action_jpeg: Some(pre_jpeg),
-                post_action_jpeg: Some(post_jpeg),
+                pre_action_b64: Some(pre_b64),
+                post_action_b64: Some(post_b64),
                 goal: goal.to_string(),
             };
 
