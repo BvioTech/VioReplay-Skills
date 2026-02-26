@@ -184,7 +184,7 @@ impl Config {
     /// Validate config values are within acceptable ranges.
     /// Returns Ok(()) if valid, or Err with a description of the first invalid field.
     pub fn validate(&self) -> Result<(), crate::Error> {
-        if self.capture.ring_buffer_size == 0 || (self.capture.ring_buffer_size & (self.capture.ring_buffer_size - 1)) != 0 {
+        if !self.capture.ring_buffer_size.is_power_of_two() {
             return Err(crate::Error::Config(format!(
                 "ring_buffer_size must be a power of 2, got {}", self.capture.ring_buffer_size
             )));

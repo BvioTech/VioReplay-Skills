@@ -275,14 +275,18 @@ impl VariableExtractor {
                 text, goal
             );
 
-            // Clone synthesizer for async block
-            let mut synth_clone = LlmSynthesizer::new();
-            if let Some(ref s) = self.llm_synthesizer {
-                if s.is_configured() {
-                    // Re-create with same config (API key from env)
-                    synth_clone = LlmSynthesizer::new();
+            // Create synthesizer for async block, preserving explicit API key if set
+            let synth_clone = match &self.llm_synthesizer {
+                Some(s) if s.is_configured() => {
+                    // Re-create with the same API key (may have been set explicitly)
+                    if let Some(ref key) = s.api_key() {
+                        LlmSynthesizer::with_api_key(key)
+                    } else {
+                        LlmSynthesizer::new()
+                    }
                 }
-            }
+                _ => LlmSynthesizer::new(),
+            };
 
             let result = rt.block_on(async {
                 synth_clone.synthesize(goal, &context_events, text, &question).await
@@ -468,7 +472,7 @@ impl VariableExtractor {
             *char_counts.entry(ch).or_insert(0) += 1;
         }
 
-        let len = text.len() as f64;
+        let len = text.chars().count() as f64;
         char_counts
             .values()
             .map(|&count| {

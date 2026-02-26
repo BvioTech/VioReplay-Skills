@@ -687,7 +687,8 @@ impl SkillGenerator {
             .collect();
 
         // For each click-based step, analyze the trajectory leading to it
-        for (step_idx, step) in steps.iter_mut().enumerate() {
+        let mut click_step_count = 0;
+        for (_step_idx, step) in steps.iter_mut().enumerate() {
             // Only adjust confidence for click-based actions
             if !matches!(
                 step.action,
@@ -697,13 +698,14 @@ impl SkillGenerator {
             }
 
             // Find the trajectory segment leading to this click
-            if step_idx >= click_indices.len() {
+            // Use click_step_count (not step_idx) to correctly index into click_indices
+            if click_step_count >= click_indices.len() {
                 continue;
             }
 
-            let click_idx = click_indices[step_idx];
-            let start_idx = if step_idx > 0 {
-                click_indices[step_idx - 1] + 1
+            let click_idx = click_indices[click_step_count];
+            let start_idx = if click_step_count > 0 {
+                click_indices[click_step_count - 1] + 1
             } else {
                 0
             };
@@ -745,6 +747,8 @@ impl SkillGenerator {
                     step.number, analysis.pattern, confidence_adjustment, step.confidence
                 );
             }
+
+            click_step_count += 1;
         }
 
         steps
@@ -1560,10 +1564,12 @@ impl SkillGenerator {
         mut steps: Vec<GeneratedStep>,
         events: &[&EnrichedEvent],
     ) -> Vec<GeneratedStep> {
-        for (i, step) in steps.iter_mut().enumerate() {
+        for (_i, step) in steps.iter_mut().enumerate() {
             let pre_event = step.source_events.first().and_then(|&idx| events.get(idx)).copied();
-            let post_event = if i + 1 < events.len() {
-                Some(events[i + 1])
+            // Use the step's last source event to find the post-event (not the step index)
+            let last_source = step.source_events.last().copied().unwrap_or(0);
+            let post_event = if last_source + 1 < events.len() {
+                Some(events[last_source + 1])
             } else {
                 pre_event
             };
