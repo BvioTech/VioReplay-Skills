@@ -962,7 +962,7 @@ impl SkillGenerator {
         let element_role = self.get_element_role(event);
 
         match event.raw.event_type {
-            EventType::LeftMouseDown | EventType::LeftMouseUp => {
+            EventType::LeftMouseDown => {
                 // Check for double-click
                 if event.raw.click_count >= 2 {
                     return Action::DoubleClick {
@@ -1002,7 +1002,7 @@ impl SkillGenerator {
                     confidence: 0.9,
                 }
             }
-            EventType::RightMouseDown | EventType::RightMouseUp => Action::RightClick {
+            EventType::RightMouseDown => Action::RightClick {
                 element_name,
                 element_role,
                 confidence: 0.9,

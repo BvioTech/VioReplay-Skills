@@ -64,7 +64,7 @@ pub struct CodegenConfig {
     pub include_screenshots: bool,
 }
 
-fn default_vision_model() -> String { "claude-haiku-4-5-20250929".to_string() }
+fn default_vision_model() -> String { "claude-haiku-4-5-20251001".to_string() }
 
 fn default_dot_radius() -> u32 { 12 }
 fn default_dot_color() -> [u8; 3] { [255, 40, 40] }
@@ -310,7 +310,7 @@ mod tests {
     fn test_codegen_config_defaults() {
         let codegen = CodegenConfig::default();
         assert_eq!(codegen.model, "claude-opus-4-6");
-        assert_eq!(codegen.vision_model, "claude-haiku-4-5-20250929");
+        assert_eq!(codegen.vision_model, "claude-haiku-4-5-20251001");
         assert_eq!(codegen.temperature, 0.3);
         assert!(!codegen.include_screenshots);
     }
@@ -393,7 +393,7 @@ mod tests {
             },
             codegen: CodegenConfig {
                 model: "claude-sonnet-4-5".to_string(),
-                vision_model: "claude-haiku-4-5-20250929".to_string(),
+                vision_model: "claude-haiku-4-5-20251001".to_string(),
                 temperature: 0.7,
                 include_screenshots: true,
             },
@@ -588,7 +588,7 @@ include_screenshots = false
             },
             codegen: CodegenConfig {
                 model: "claude-opus-4-6".to_string(),
-                vision_model: "claude-haiku-4-5-20250929".to_string(),
+                vision_model: "claude-haiku-4-5-20251001".to_string(),
                 temperature: 1.0,
                 include_screenshots: true,
             },
