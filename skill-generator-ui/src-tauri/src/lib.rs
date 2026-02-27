@@ -317,8 +317,11 @@ fn set_api_key(state: State<AppState>, key: String) -> Result<(), String> {
 fn get_api_key(state: State<AppState>) -> Result<Option<String>, String> {
     let api_key = state.api_key.lock().map_err(|e| e.to_string())?;
     Ok(api_key.as_ref().map(|k| {
-        if k.len() > 8 {
-            format!("{}...{}", &k[..4], &k[k.len()-4..])
+        let chars: Vec<char> = k.chars().collect();
+        if chars.len() > 8 {
+            let prefix: String = chars[..4].iter().collect();
+            let suffix: String = chars[chars.len()-4..].iter().collect();
+            format!("{}...{}", prefix, suffix)
         } else {
             "****".to_string()
         }
@@ -331,90 +334,99 @@ fn start_recording(state: State<AppState>, name: String, goal: Option<String>) -
     // Initialize timebase
     MachTimebase::init();
 
-    // Check if already recording
+    // Atomically check and set recording flag to prevent TOCTOU race
     {
-        let is_recording = state.is_recording.lock().map_err(|e| e.to_string())?;
+        let mut is_recording = state.is_recording.lock().map_err(|e| e.to_string())?;
         if *is_recording {
             return Err("Recording already in progress".to_string());
         }
+        *is_recording = true;
     }
 
-    // Check accessibility permissions
-    if !check_accessibility_permissions() {
-        return Err("Accessibility permissions not granted. Please enable in System Preferences > Security & Privacy > Privacy > Accessibility".to_string());
-    }
+    // Perform setup in a closure so we can reset is_recording on failure
+    let result = (|| -> Result<(), String> {
+        // Check accessibility permissions
+        if !check_accessibility_permissions() {
+            return Err("Accessibility permissions not granted. Please enable in System Preferences > Security & Privacy > Privacy > Accessibility".to_string());
+        }
 
-    // Create ring buffer
-    let buffer = EventRingBuffer::with_capacity(DEFAULT_CAPACITY);
-    let (producer, consumer) = buffer.split();
+        // Create ring buffer
+        let buffer = EventRingBuffer::with_capacity(DEFAULT_CAPACITY);
+        let (producer, consumer) = buffer.split();
 
-    // Create event tap
-    let mut event_tap = EventTap::new().map_err(|e| e.to_string())?;
+        // Create event tap
+        let mut event_tap = EventTap::new().map_err(|e| e.to_string())?;
 
-    // Start the event tap
-    event_tap.start(producer).map_err(|e| e.to_string())?;
+        // Start the event tap
+        event_tap.start(producer).map_err(|e| e.to_string())?;
 
-    // Create recording
-    let recording_name = if name.is_empty() {
-        chrono::Local::now().format("recording_%Y%m%d_%H%M%S").to_string()
-    } else {
-        sanitize_filename(&name)?
-    };
-    let recording = Recording::new(recording_name.clone(), goal);
-
-    // Start screenshot capturer if enabled
-    let should_capture = *state.capture_screenshots.lock().map_err(|e| e.to_string())?;
-    if should_capture {
-        let recordings_dir = dirs::home_dir()
-            .ok_or("Could not find home directory")?
-            .join(".skill_generator")
-            .join("recordings");
-        let screenshots_dir = recordings_dir.join(&recording_name).join("screenshots");
-        std::fs::create_dir_all(&screenshots_dir).map_err(|e| e.to_string())?;
-
-        let config = ScreenshotConfig {
-            jpeg_quality: 0.8,
-            max_width: 1024,
+        // Create recording
+        let recording_name = if name.is_empty() {
+            chrono::Local::now().format("recording_%Y%m%d_%H%M%S").to_string()
+        } else {
+            sanitize_filename(&name)?
         };
-        let capturer = ScreenshotCapturer::start(screenshots_dir, config);
+        let recording = Recording::new(recording_name.clone(), goal);
 
-        let mut ss_cap = state.screenshot_capturer.lock().map_err(|e| e.to_string())?;
-        *ss_cap = Some(capturer);
+        // Start screenshot capturer if enabled
+        let should_capture = *state.capture_screenshots.lock().map_err(|e| e.to_string())?;
+        if should_capture {
+            let recordings_dir = dirs::home_dir()
+                .ok_or("Could not find home directory")?
+                .join(".skill_generator")
+                .join("recordings");
+            let screenshots_dir = recordings_dir.join(&recording_name).join("screenshots");
+            std::fs::create_dir_all(&screenshots_dir).map_err(|e| e.to_string())?;
+
+            let config = ScreenshotConfig {
+                jpeg_quality: 0.8,
+                max_width: 1024,
+            };
+            let capturer = ScreenshotCapturer::start(screenshots_dir, config);
+
+            let mut ss_cap = state.screenshot_capturer.lock().map_err(|e| e.to_string())?;
+            *ss_cap = Some(capturer);
+        }
+
+        // Reset screenshot sequence
+        {
+            let mut seq = state.screenshot_sequence.lock().map_err(|e| e.to_string())?;
+            *seq = 0;
+        }
+        {
+            let mut last_ss = state.last_screenshot_time.lock().map_err(|e| e.to_string())?;
+            *last_ss = std::time::Instant::now();
+        }
+
+        // Store state
+        {
+            let mut rec = state.recording.lock().map_err(|e| e.to_string())?;
+            *rec = Some(recording);
+        }
+        {
+            let mut tap = state.event_tap.lock().map_err(|e| e.to_string())?;
+            *tap = Some(event_tap);
+        }
+        {
+            let mut cons = state.consumer.lock().map_err(|e| e.to_string())?;
+            *cons = Some(consumer);
+        }
+        {
+            let mut last_cp = state.last_checkpoint_count.lock().map_err(|e| e.to_string())?;
+            *last_cp = 0;
+        }
+
+        Ok(())
+    })();
+
+    // Reset is_recording flag on setup failure
+    if result.is_err() {
+        if let Ok(mut is_rec) = state.is_recording.lock() {
+            *is_rec = false;
+        }
     }
 
-    // Reset screenshot sequence
-    {
-        let mut seq = state.screenshot_sequence.lock().map_err(|e| e.to_string())?;
-        *seq = 0;
-    }
-    {
-        let mut last_ss = state.last_screenshot_time.lock().map_err(|e| e.to_string())?;
-        *last_ss = std::time::Instant::now();
-    }
-
-    // Store state
-    {
-        let mut rec = state.recording.lock().map_err(|e| e.to_string())?;
-        *rec = Some(recording);
-    }
-    {
-        let mut tap = state.event_tap.lock().map_err(|e| e.to_string())?;
-        *tap = Some(event_tap);
-    }
-    {
-        let mut cons = state.consumer.lock().map_err(|e| e.to_string())?;
-        *cons = Some(consumer);
-    }
-    {
-        let mut is_rec = state.is_recording.lock().map_err(|e| e.to_string())?;
-        *is_rec = true;
-    }
-    {
-        let mut last_cp = state.last_checkpoint_count.lock().map_err(|e| e.to_string())?;
-        *last_cp = 0;
-    }
-
-    Ok(())
+    result
 }
 
 /// Get current recording status
@@ -958,6 +970,7 @@ async fn generate_skill(state: State<'_, AppState>, recording_path: String) -> R
         };
 
         // Create generator with API key and pipeline config from state
+        let recording_dir = path.parent().map(|p| p.to_path_buf());
         let gen_config = skill_generator::workflow::generator::GeneratorConfig {
             api_key: api_key_value.clone(),
             use_action_clustering: config.pipeline.use_action_clustering,
@@ -969,6 +982,7 @@ async fn generate_skill(state: State<'_, AppState>, recording_path: String) -> R
             use_state_diff: config.pipeline.use_state_diff,
             use_error_correction_filter: config.pipeline.use_error_correction_filter,
             screenshot_analysis,
+            recording_dir,
             ..Default::default()
         };
         let generator = SkillGenerator::with_config(gen_config);
@@ -1284,12 +1298,13 @@ fn delete_recording(name: Option<String>, recording_path: Option<String>) -> Res
         }
         canonical
     } else {
-        // Treat as a name - look up in recordings dir (flat file first, then directory)
-        let file_path = recordings_dir.join(format!("{}.json", target));
+        // Treat as a name - sanitize before using in path
+        let sanitized = sanitize_filename(&target)?;
+        let file_path = recordings_dir.join(format!("{}.json", sanitized));
         if file_path.exists() && !file_path.is_symlink() {
             file_path
         } else {
-            let dir_path = recordings_dir.join(&target);
+            let dir_path = recordings_dir.join(&sanitized);
             if dir_path.is_symlink() {
                 return Err("Cannot delete symlinks".to_string());
             }
@@ -1351,7 +1366,7 @@ pub struct UiConfig {
 }
 
 fn default_capture_screenshots() -> bool { true }
-fn default_vision_model() -> String { "claude-haiku-4-5-20250929".to_string() }
+fn default_vision_model() -> String { "claude-haiku-4-5-20251001".to_string() }
 fn default_true() -> bool { true }
 fn default_dot_radius() -> u32 { 12 }
 fn default_dot_color() -> [u8; 3] { [255, 40, 40] }
@@ -1430,6 +1445,28 @@ fn save_config(state: State<AppState>, config: UiConfig) -> Result<(), String> {
 /// Read a generated SKILL.md file for preview
 #[tauri::command]
 fn read_skill_file(path: String) -> Result<String, String> {
+    let skills_dir = dirs::home_dir()
+        .ok_or("Could not find home directory")?
+        .join(".claude")
+        .join("skills");
+
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("File not found: {}", path));
+    }
+    if p.is_symlink() {
+        return Err("Cannot read symlinks".to_string());
+    }
+
+    // Validate path is within allowed skills directory
+    if skills_dir.exists() {
+        let canonical = std::fs::canonicalize(p).map_err(|e| e.to_string())?;
+        let canonical_dir = std::fs::canonicalize(&skills_dir).map_err(|e| e.to_string())?;
+        if !canonical.starts_with(&canonical_dir) {
+            return Err("Access denied: path is outside the skills directory".to_string());
+        }
+    }
+
     std::fs::read_to_string(&path).map_err(|e| format!("Failed to read {}: {}", path, e))
 }
 
@@ -1442,12 +1479,15 @@ fn export_config() -> Result<String, String> {
 
 /// Import config from a TOML string, validate, and save
 #[tauri::command(rename_all = "camelCase")]
-fn import_config(toml_content: String) -> Result<(), String> {
+fn import_config(state: State<AppState>, toml_content: String) -> Result<(), String> {
     // Parse and validate before saving
     let config: Config = toml::from_str(&toml_content)
         .map_err(|e| format!("Invalid TOML config: {}", e))?;
     config.validate().map_err(|e| e.to_string())?;
     config.save_default().map_err(|e| e.to_string())?;
+    // Sync in-memory screenshot capture toggle
+    let mut capture_ss = state.capture_screenshots.lock().map_err(|e| e.to_string())?;
+    *capture_ss = config.capture.capture_screenshots;
     info!("Config imported and saved");
     Ok(())
 }
@@ -1724,6 +1764,7 @@ mod tests {
             duration_seconds: 3.5,
             has_accessibility: true,
             has_screen_recording: false,
+            hotkey_stopped: false,
         };
         let json = serde_json::to_string(&status).unwrap();
         let deserialized: RecordingStatus = serde_json::from_str(&json).unwrap();
@@ -1824,7 +1865,7 @@ mod tests {
             hesitation_threshold: 150.0,
             min_pause_ms: 300,
             model: "claude-opus-4-6".to_string(),
-            vision_model: "claude-haiku-4-5-20250929".to_string(),
+            vision_model: "claude-haiku-4-5-20251001".to_string(),
             temperature: 0.7,
             use_action_clustering: true,
             use_local_recovery: true,
@@ -1845,7 +1886,7 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: UiConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.model, "claude-opus-4-6");
-        assert_eq!(deserialized.vision_model, "claude-haiku-4-5-20250929");
+        assert_eq!(deserialized.vision_model, "claude-haiku-4-5-20251001");
         assert!(!deserialized.use_vision_ocr);
         assert!((deserialized.temperature - 0.7).abs() < f32::EPSILON);
     }

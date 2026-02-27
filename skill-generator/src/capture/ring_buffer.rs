@@ -223,6 +223,8 @@ impl EventProducer {
             }
             Err(_) => {
                 self.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+                // Roll back sequence number on failure (consistent with try_push)
+                self.sequence.fetch_sub(1, Ordering::Relaxed);
                 false
             }
         }

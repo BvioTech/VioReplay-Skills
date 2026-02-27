@@ -618,12 +618,12 @@ impl VisionFallback {
         let rel_h = height / region_h.max(1.0);
         let area_ratio = rel_w * rel_h;
 
-        if (aspect_ratio - 1.0).abs() < 0.15 && area_ratio < 0.01 {
+        if (aspect_ratio - 1.0).abs() < 0.2 && area_ratio < 0.005 {
+            // Tiny square: close/minimize button (check before checkbox to avoid overlap)
+            "CloseButton".to_string()
+        } else if (aspect_ratio - 1.0).abs() < 0.15 && area_ratio < 0.01 {
             // Small square: checkbox or radio button
             "Checkbox".to_string()
-        } else if (aspect_ratio - 1.0).abs() < 0.2 && area_ratio < 0.005 {
-            // Tiny square: close/minimize button
-            "CloseButton".to_string()
         } else if area_ratio > 0.2 {
             // Large area: panel or dialog
             "Panel".to_string()

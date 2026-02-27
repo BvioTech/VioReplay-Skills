@@ -126,6 +126,11 @@ impl LlmSynthesizer {
         self.api_key.is_some()
     }
 
+    /// Get a reference to the API key (if configured)
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
     /// Synthesize variable meaning from context
     pub async fn synthesize(
         &mut self,

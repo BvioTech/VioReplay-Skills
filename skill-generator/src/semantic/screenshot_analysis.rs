@@ -82,7 +82,7 @@ impl Default for AnalysisConfig {
     fn default() -> Self {
         Self {
             ocr_confidence_threshold: 0.5,
-            claude_model: "claude-haiku-4-5-20250929".to_string(),
+            claude_model: "claude-haiku-4-5-20251001".to_string(),
             max_tokens: 256,
         }
     }
@@ -774,7 +774,7 @@ mod tests {
         let body = build_vision_request(&analysis, &jpeg_data, None, &event, "Test goal", &config, &ann_config);
 
         // Verify structure
-        assert_eq!(body["model"], "claude-haiku-4-5-20250929");
+        assert_eq!(body["model"], "claude-haiku-4-5-20251001");
         assert!(body["messages"][0]["content"][0]["source"]["data"].is_string());
         assert_eq!(body["messages"][0]["content"][0]["type"], "image");
         assert!(body["messages"][0]["content"][1]["text"].as_str().unwrap().contains("Test goal"));
